@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<ThermalConfiguration>
+  <Platform>
+    <Name>ASUS PL64 firmware thermal policy</Name>
+    <ProductName>MINIPC PL64</ProductName>
+    <Preference>QUIET</Preference>
+    <!-- Use the BIOS's thermal trips, cooling bindings and power limits. -->
+  </Platform>
+</ThermalConfiguration>

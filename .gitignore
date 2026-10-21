@@ -1,0 +1,12 @@
+/builder/builder_ed25519
+/builder/builder_ed25519.pub
+/builder/state/
+/builder/known_hosts
+/builder/ssh_config
+/builder/cloud-init.yaml
+/builder/launch.json
+/builder/nix-install.sh
+/artifacts/
+/result*
+__pycache__/
+.DS_Store
