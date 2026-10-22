@@ -220,6 +220,140 @@ Use this explicit flake workflow. The image omits legacy channels and the
 implicit Nixpkgs source checkout; updates fetch the inputs pinned by
 `flake.lock` when needed.
 
+## IMU serial ports
+
+`nixos/navigation.nix` configures both onboard Fintek serial ports at the
+IMU-1221-R02-232 factory settings: 9600 baud, 8 data bits, no parity, one stop
+bit, raw input/output, no RTS/CTS or XON/XOFF flow control, and no requirement
+for a carrier-detect signal. Settings are applied when each port appears,
+including at boot. Stable aliases are `/dev/pl64com1` and `/dev/pl64com2`.
+The connected IMU is verified on **`/dev/pl64com1`**, at sensor address `0x00`.
+There is no IMU polling daemon or sensor-side configuration in this setup.
+
+```sh
+stty -F /dev/pl64com1 -a
+stty -F /dev/pl64com2 -a
+systemctl status pl64-com1-settings pl64-com2-settings
+```
+
+The IMU normally waits for a binary query rather than streaming on power-up.
+The manufacturer's [digital protocol](https://www.analogtechnologies.com/document/Digital_Protocol.pdf)
+documents an address query `77 04 00 1f 23` and a combined gyro/accelerometer
+query `77 04 00 59 5d`. These are raw hexadecimal bytes, with no line ending.
+Do not type their hexadecimal spelling into a terminal and expect a reply.
+
+To request one combined gyro/accelerometer sample from the PL64 console:
+
+```sh
+printf '\x77\x04\x00\x59\x5d' |
+  socat -t 1 -T 1 - /dev/pl64com1,raw,echo=0,b9600,cs8,parenb=0,cstopb=0,crtscts=0,ixon=0,ixoff=0,clocal=1 |
+  od -An -tx1
+```
+
+The response is 23 bytes beginning `77 16 00 84`: three signed BCD gyro
+values in degrees/second, then three signed BCD acceleration values in g,
+followed by the checksum. Run only one serial reader at a time.
+
+On 21 October 2026, address, gyro, acceleration and combined queries all
+returned valid checksums. A five-second check received 50/50 valid combined
+responses at 10 polls/second. Mean gyro readings were approximately
+`[0.005, -0.035, -0.042]` degrees/second, and acceleration was
+`[0.0031, 0.0092, 1.0008]` g, consistent with a stationary, nearly level
+sensor. Mean request-to-response time was 37.6 ms at 9600 baud; this is
+communication latency, not a measurement of sensor latency. The earlier
+silence was resolved by connecting the cable to the serial port. Diagnostic
+logs are under `artifacts/navigation/`.
+
+Further tests on 21 October 2026 verified continuous output at
+5, 10, 20, 25, 50, 100, 200 and 500 Hz. At 460800 baud, both combined BCD
+and combined floating-point output worked without checksum errors. The
+500 Hz stream repeated six-axis values in a two/three-packet pattern,
+giving about **200 distinct measurements per second**. The floating-point
+packet counter advanced on every packet, including repeated measurements.
+Output frequency therefore must not be mistaken for the internal sample rate.
+
+The newer [BWSensing V4 protocol](https://www.bwsensing.com.cn/upload/userfile/IMU_VG_AH_MINS_%E6%95%B0%E5%AD%97%E8%BE%93%E5%87%BA%E5%8D%8F%E8%AE%AE%E6%89%8B%E5%86%8C.pdf)
+documents these controls. Command numbers below omit framing, address and
+checksum; they are not complete packets.
+
+| Control | Command | Options / verified behavior |
+| --- | --- | --- |
+| Output frequency | `0x0c` | `0` = query mode; `1`–`8` = 5/10/20/25/50/100/200/500 Hz; all tested |
+| Stream contents | `0x56` | `0` gyro, `1` acceleration, `2` combined BCD, `3` combined float; combined modes tested |
+| Baud rate | `0x0b` | 2400–460800 with a non-monotonic option mapping; 9600 and 460800 tested |
+| Read float sample | `0x70` | Six little-endian float32 values, followed by a four-byte BCD counter |
+| Startup gyro zero calibration | Read `0xf8`, set `0xf7` | Readback was enabled (`1`); setter not exercised |
+| Gyro zero calibration | `0x52` / `0x5a` | Documented calibration controls; not exercised |
+| Save settings | `0x0a` | Explicit nonvolatile save; not exercised |
+
+The 33-byte floating-point packet avoids the coarse BCD rounding, but a
+60-second capture gave similar noise to the previous five-minute BCD run:
+gyro ARW approximately `[0.90, 0.59, 0.71]` degrees/sqrt(hour), compared with
+the datasheet's 0.1 maximum. This is a stationary-output comparison, not a
+controlled bandwidth or environmental qualification. Evidence and plots are
+in `artifacts/imu-settings-20261021/report.html`; the original analysis is in
+`artifacts/imu-noise-20261021/report.html`.
+
+A subsequent five-minute, continuous floating-point test at 100 Hz received
+30,001 frames at a measured 100.0026 Hz, with zero repeated six-axis values,
+checksum errors or counter gaps. Gyro ARW was approximately
+`[0.856, 0.592, 0.698]` degrees/sqrt(hour), within about 5% of the 500 Hz float
+run. Acceleration VRW was `[0.0849, 0.0877, 0.0890]` m/s/sqrt(hour). The
+elevated noise therefore persists without repeated output samples. Comparison
+plots, means and Allan values are in `artifacts/imu-rates-20261021/report.html`.
+The requested 200 Hz run was cancelled and excluded from the analysis.
+
+Static inspection of the vendor configuration software recovered two working
+identity queries, tested with valid checksums on this unit:
+
+| Query | Complete hexadecimal request | Result |
+| --- | --- | --- |
+| Firmware identity | `77 04 00 49 4d` | `IMU50-T-IAP-GD#AH100-V4-B8#24.09.20SV2.0` |
+| Serial number | `77 04 00 43 47` | `250905100005` |
+
+Two possible filter interfaces were identified: the general configuration
+GUI uses read `0x16` / set `0x15`, and the BW-VG500 manual describes read
+`0x81` / set `0x80`. Neither read command elicited a reply from this IMU,
+although identity queries before and after worked. Neither filter setter
+was sent; support and parameter meanings on this model remain unverified.
+No adjustable sensor bandwidth or Kalman gain was established.
+
+Additional GUI commands absent from the shared IMU manual are listed below.
+These are software references, not proof that the attached IMU supports the
+setters. Only the explicitly identified read commands were probed.
+
+| GUI function | Command and payload | Finding |
+| --- | --- | --- |
+| Angular zero offset | Read `0x74`; set `0x75` + 3-byte BCD angle | Units are degrees, not gyro bias; read `77 04 00 74 78` got no reply |
+| Axis orientation | `0x5c` + index `0`–`4` | Horizontal, vertical, pendulum, pitch, roll in the GUI; not exercised |
+| Axis sign | `0x5b` + X/Y/Z flags | Each flag is `0` for positive or `1` for negative; not exercised |
+| Protocol mode | `0x53` + index `0`–`4` | Compatibility, RS232/77, RS485/77, RS232/Modbus, RS485/Modbus; not exercised |
+| Serial-number write | `0x44` + 30-byte string field | Hidden in the serial-number label's click handler; not exercised |
+
+The GUI also has compass calibration, magnetic declination, tilt alarms and
+analogue-output controls, which are not evidence of support on this six-axis
+IMU. Its generic output-mode labels differ from this IMU's verified `0x56`
+mapping: GUI index `3` is labelled magnetometer, but this IMU uses it for
+combined floating-point gyro/acceleration. Use the IMU protocol and measured
+responses rather than assuming every GUI control applies. The disassembly,
+handler/command cross-reference and read-probe logs are retained with the
+investigation artifacts.
+
+The public V3/V4 protocols, configuration packages 3.0.3/3.0.8/3.1.0 and
+vendor C examples yielded no compatible IMU firmware image or binary firmware
+readback command. The `IAP` identity suggests an update capability but does
+not prove that flash readback is supported. Version `0x49` reads an identity
+string, not the firmware binary. The example `USART.hex` files target a
+separate STM32 host board and must not be flashed to the IMU. A vendor update
+would need to match the complete identity above and preserve factory calibration.
+
+All temporary tests restored 9600 baud, query mode and stream type `0`.
+Baud changes take effect immediately and automatically persist; the original
+baud was restored and communication verified. No filter, calibration or explicit
+save command was sent. `pl64-com1-settings` was restarted and verified active.
+The Nix setup still applies serial-port settings only; these experiments did
+not add a boot-time sensor configuration or acquisition service.
+
 ## Firmware updates
 
 The installed system enables the standard NixOS fwupd service. Check its signed

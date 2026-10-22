@@ -1,5 +1,6 @@
 { lib, ... }:
 {
+  imports = [ ./navigation.nix ];
   networking.hostName = "pl64";
   services.avahi = {
     enable = true;
