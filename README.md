@@ -444,3 +444,11 @@ Update `revision` in `pkgs/usdr/default.nix` to the corresponding driver commit,
 rebuild the three packages, and retain the matched FPGA source/build identity.
 The FPGA bitstream remains a separately built Vivado artifact; there is no
 automatic flash or firmware-update service.
+
+The 24 October 2026 bring-up uses driver `49c3d57` and operational FPGA
+`c53414a7` (RTL `04a3c78`; clean build flow `a2e830c`). A physical power cycle
+confirmed PCIe boot and automatic module loading. Short native receive tests
+passed at 8, 61.44 and 64 MS/s; full RF qualification is still pending. The
+driver patch includes the rev3 reference-buffer startup order and receive-only,
+repeatable analog DC calibration fixes found during these checks. Detailed
+results are in `usdr-lib/audit/2026-10-22/TARGET_TESTS.txt`.
