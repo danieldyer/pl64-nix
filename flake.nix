@@ -10,12 +10,16 @@
       configurationSource = nixpkgs.lib.fileset.toSource {
         root = ./.;
         fileset = nixpkgs.lib.fileset.unions [
-          ./flake.nix ./flake.lock ./nixos ./keys ./README.md
+          ./flake.nix ./flake.lock ./nixos ./pkgs ./keys ./README.md
         ];
       };
       pl64 = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [ ./nixos/base.nix ./nixos/hardware.nix ./nixos/pl64.nix ];
+      };
+      usdr = import ./pkgs/usdr {
+        inherit pkgs;
+        kernelPackages = pl64.config.boot.kernelPackages;
       };
       installer = nixpkgs.lib.nixosSystem {
         inherit system;
@@ -32,6 +36,9 @@
         default = installer.config.system.build.isoImage;
         installer-iso = installer.config.system.build.isoImage;
         system = pl64.config.system.build.toplevel;
+        usdr-lib = usdr.library;
+        usdr-kernel-module = usdr.kernelModule;
+        usdr-native-probe = usdr.probe;
         qemu = pkgs.qemu_kvm;
         ovmf = pkgs.OVMF.fd;
       };

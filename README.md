@@ -408,3 +408,39 @@ from this build setup. The original Codex instance and its disk were preserved.
 The local ISO checksum was verified again before deletion. Cleanup evidence is
 in `artifacts/validation/cleanup.json`. The project-local SSH key, host-key pin
 and instance state remain ignored by Git; the old builder cannot be restarted.
+
+## uSDR receive development
+
+The `dd/usdr-rx-bringup` branch packages the matched uSDR library, PCIe kernel
+module and native receive probe. `pkgs/usdr` pins a public upstream revision
+and applies the checked-in essential-fix patch; rebuilding does not depend on
+adjacent working trees or unpublished Git commits. The package metadata records
+the driver code revision. The installed system enables headless Intel Vulkan
+support through Mesa and provides `vulkaninfo`; no desktop is enabled.
+
+Build on the Ubuntu VM after syncing this checkout into a separate directory:
+
+```sh
+nix build .#usdr-lib .#usdr-kernel-module .#usdr-native-probe -L
+nix build .#system -L -o result-system
+```
+
+The kernel module uses this flake's selected kernel (currently 7.2.11), rather
+than the Ubuntu builder's running kernel. Library register/transport tests run
+during the Nix build. The probe's build check only prints help; it opens no SDR.
+Use the driver and kernel module with the matching FPGA `dd/essential-rx-fixes`
+image. Building this configuration neither activates it on the PL64 nor programs
+the FPGA. Validate the FPGA build before deploying the matched set for target
+tests. Temporary experiments may live under `/tmp`; keep enduring settings here.
+
+To refresh the patch from the driver checkout after an essential-fix commit:
+
+```sh
+git -C ../usdr-lib diff --binary f7e869df29582934b87d3759e3c108d60a27e451 HEAD \
+  -- src audit/2026-10-22/native_rx_probe.c > pkgs/usdr/essential-rx.patch
+```
+
+Update `revision` in `pkgs/usdr/default.nix` to the corresponding driver commit,
+rebuild the three packages, and retain the matched FPGA source/build identity.
+The FPGA bitstream remains a separately built Vivado artifact; there is no
+automatic flash or firmware-update service.

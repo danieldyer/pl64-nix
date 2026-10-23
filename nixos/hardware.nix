@@ -29,8 +29,9 @@ in
   hardware.cpu.intel.updateMicrocode = true;
   hardware.cpu.amd.updateMicrocode = lib.mkForce false;
 
-  # Kernel modesetting provides the HDMI text console without Mesa, X11 or a DM.
-  hardware.graphics.enable = false;
+  # The installer needs only modesetting; the installed SDR system enables Mesa
+  # in usdr.nix for headless Vulkan compute. Neither uses X11 or a display manager.
+  hardware.graphics.enable = lib.mkDefault false;
 
   # intel_pstate's powersave policy allows HWP to scale dynamically and turbo;
   # it is not the generic governor that pins a CPU to its lowest frequency.

@@ -1,0 +1,4007 @@
+diff --git a/audit/2026-10-22/native_rx_probe.c b/audit/2026-10-22/native_rx_probe.c
+new file mode 100644
+index 0000000..1f5b5f7
+--- /dev/null
++++ b/audit/2026-10-22/native_rx_probe.c
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: MIT
++// Target-only PCIe receive probe: native loans, or exactly one CI16 memcpy.
++#include <dm_dev.h>
++#include <dm_stream.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++static double now(void)
++{
++    struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);
++    return t.tv_sec+t.tv_nsec*1e-9;
++}
++static int set(pdm_dev_t d,const char *path,uint64_t value)
++{
++    int r=usdr_dme_set_uint(d,path,value);
++    if(r)fprintf(stderr,"%s: %s\n",path,strerror(-r));
++    return r;
++}
++static void show(pdm_dev_t d,const char *path)
++{
++    uint64_t v=0;int r=usdr_dme_get_uint(d,path,&v);
++    if(r)fprintf(stderr,"%s: %s\n",path,strerror(-r));
++    else printf("%s=%llu\n",path,(unsigned long long)v);
++}
++int main(int argc,char **argv)
++{
++    const char *device="bus=pcie",*input="EXT";
++    unsigned rate=64000000,frequency=202000000,bandwidth=28000000,gain=30;
++    double seconds=10;int copy=0,c,res=0,started=0,loan=0;
++    while((c=getopt(argc,argv,"d:i:r:f:b:g:s:ch"))!=-1)switch(c){
++        case 'd':device=optarg;break;case 'i':input=optarg;break;
++        case 'r':rate=strtoul(optarg,NULL,0);break;case 'f':frequency=strtoul(optarg,NULL,0);break;
++        case 'b':bandwidth=strtoul(optarg,NULL,0);break;case 'g':gain=strtoul(optarg,NULL,0);break;
++        case 's':seconds=strtod(optarg,NULL);break;case 'c':copy=1;break;
++        default:fprintf(stderr,"%s [-d bus=pcie,dev=usdr0] [-i EXT|W|H|auto] [-r rate_Hz] [-f RF_Hz] [-b RF_BW_Hz] [-g relative_dB] [-s seconds] [-c one_copy]\n",argv[0]);return c=='h'?0:1;
++    }
++    if(!(seconds>0 && seconds<=3600) || rate<1000000 || rate>65000000 || !frequency || gain>85)return 1;
++    pdm_dev_t d=NULL;pusdr_dms_t s=NULL;usdr_dms_rx_block_t b={0};
++    void *scratch=copy?malloc(65536):NULL;
++    if(copy && !scratch)return 1;
++    // Indirect call prevents dead-store elimination in this standalone copy benchmark.
++    void *(*volatile copy_samples)(void*,const void*,size_t)=memcpy;
++    uint64_t blocks=0,samples=0,lost=0,expected=0,checksum=0;unsigned timeouts=0;
++    double begin=0,elapsed=0;
++    res=usdr_dmd_create_string(device,&d);if(res)goto done;
++    res=set(d,"/dm/power/en",1);if(res)goto done;
++    res=set(d,"/dm/rate/master",rate);if(res)goto done;
++    res=usdr_dme_set_string(d,"/dm/sdr/0/rx/path",input);if(res)goto done;
++    res=set(d,"/dm/sdr/0/rx/frequency",frequency);if(res)goto done;
++    res=set(d,"/dm/sdr/0/rx/bandwidth",bandwidth);if(res)goto done;
++    res=set(d,"/dm/sdr/0/rx/gain/auto",gain);if(res)goto done;
++    res=usdr_dms_create(d,"/ll/srx/0","ci16",1,16384,&s);if(res)goto done;
++    show(d,"/dm/rate/master");show(d,"/dm/rate/adc");show(d,"/dm/sdr/0/rx/frequency");
++    show(d,"/dm/sdr/0/rx/frequency/lob");show(d,"/dm/sdr/0/rx/bandwidth");
++    show(d,"/dm/sdr/0/rx/gain/auto");show(d,"/dm/sdr/0/rx/dccorr");
++    res=usdr_dms_sync(d,"off",1,&s);if(res)goto done;
++    started=1;res=usdr_dms_op(s,USDR_DMS_START,0);if(res)goto done;
++    res=usdr_dms_sync(d,"none",1,&s);if(res)goto done;
++    begin=now();
++    while(now()-begin<seconds){
++        res=usdr_dms_acquire(s,250,&b);
++        if(res==-ETIMEDOUT){++timeouts;res=0;continue;}
++        if(res)break;
++        loan=1;
++        if(b.format!=USDR_DMS_NATIVE_CI16_LE || b.bytes!=4ull*b.samples || b.bytes>65536){res=-EINVAL;break;}
++        if(blocks && b.timestamp!=expected+b.lost_samples){res=-EIO;break;}
++        if(copy){copy_samples(scratch,b.data,b.bytes);checksum^=((const uint32_t*)scratch)[b.samples/2];}
++        expected=b.timestamp+b.samples;lost+=b.lost_samples;samples+=b.samples;++blocks;
++        res=usdr_dms_release(s,&b);if(res)break;loan=0;
++    }
++    elapsed=now()-begin;
++    printf("mode=%s blocks=%llu samples=%llu lost=%llu timeouts=%u elapsed=%.6f rate=%.3f_MSps checksum=%llu\n",
++        copy?"one-copy":"borrow-only",(unsigned long long)blocks,(unsigned long long)samples,
++        (unsigned long long)lost,timeouts,elapsed,samples/elapsed/1e6,(unsigned long long)checksum);
++    if(!res && (!blocks || lost || timeouts))res=-EIO;
++done:
++    if(loan){int r=usdr_dms_release(s,&b);if(!res)res=r;}
++    if(started){int r=usdr_dms_op(s,USDR_DMS_STOP,0);if(!res)res=r;}
++    if(s){int r=usdr_dms_destroy(s);if(!res)res=r;}
++    if(d){int r=usdr_dmd_close(d);if(!res)res=r;}
++    free(scratch);
++    if(res)fprintf(stderr,"Probe failed: %s (%d)\n",strerror(-res),res);
++    return res?1:0;
++}
+diff --git a/src/cmake/usdr.pc.in b/src/cmake/usdr.pc.in
+index 71e54fd..23ffa10 100644
+--- a/src/cmake/usdr.pc.in
++++ b/src/cmake/usdr.pc.in
+@@ -1,7 +1,7 @@
+ prefix=@CMAKE_INSTALL_PREFIX@
+-exec_prefix=${prefix}/@CMAKE_INSTALL_BINDIR@
+-libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
+-includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@/usdr
++exec_prefix=${prefix}
++libdir=@CMAKE_INSTALL_FULL_LIBDIR@
++includedir=@CMAKE_INSTALL_FULL_INCLUDEDIR@/usdr
+ 
+ Name: @PACKAGE_NAME@
+ Description: usdr library
+diff --git a/src/lib/cal/cal_lo_iqimb.c b/src/lib/cal/cal_lo_iqimb.c
+index 3af7f0c..9ae051b 100644
+--- a/src/lib/cal/cal_lo_iqimb.c
++++ b/src/lib/cal/cal_lo_iqimb.c
+@@ -249,6 +249,9 @@ int _calibrate_iqimb_generic(struct calibrate_ops* ops,
+         return res;
+ 
+     USDR_LOG("UDEV", USDR_LOG_WARNING, "CAL_IQIMB: Imbalance %d pwr (%d) improvement %d [PHA=%d IQ=%d]\n", b, pwr_r - b, pwr_i - b, a, giq);
++    ops->i = a;
++    ops->q = giq;
++    ops->bestmeas = b;
+     return 0;
+ }
+ 
+diff --git a/src/lib/device/m2_lm6_1/m2_lm6_1.c b/src/lib/device/m2_lm6_1/m2_lm6_1.c
+index 729ba90..71b1c6e 100644
+--- a/src/lib/device/m2_lm6_1/m2_lm6_1.c
++++ b/src/lib/device/m2_lm6_1/m2_lm6_1.c
+@@ -224,12 +224,15 @@ static int usdr_device_m2_lm6_1_calibrate_get(pdevice_t ud, pusdr_vfs_obj_t obj,
+ 
+ static int dev_m2_lm6_1_sdr_rx_dccorrmode_set(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t value);
+ 
++static int usdr_applied_get(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t *out);
++
+ static
+ const usdr_dev_param_func_t s_fparams_m2_lm6_1_rev000[] = {
+     { "/ll/sdr/max_sw_rx_chans",  { NULL, dev_m2_lm6_1_max_sw_rx_chans_get } },
+     { "/ll/sdr/max_sw_tx_chans",  { NULL, dev_m2_lm6_1_max_sw_tx_chans_get } },
+ 
+-    { "/dm/rate/master",        { dev_m2_lm6_1_rate_set, NULL }},
++    { "/dm/rate/master",        { dev_m2_lm6_1_rate_set, usdr_applied_get }},
++    { "/dm/rate/adc",           { NULL, usdr_applied_get }},
+     { "/dm/rate/rxtxadcdac",    { dev_m2_lm6_1_rate_m_set, NULL }},
+ 
+     { "/dm/debug/all",          { NULL, dev_m2_lm6_1_debug_all_get }},
+@@ -253,16 +256,16 @@ const usdr_dev_param_func_t s_fparams_m2_lm6_1_rev000[] = {
+ 
+     { "/dm/sdr/0/calibrate_dc", { dev_m2_lm6_1_sdr_dc_calib, NULL }},
+ 
+-    { "/dm/sdr/0/rx/frequency/lob",{ dev_m2_lm6_1_sdr_rx_freq_lob_set, NULL }},
+-    { "/dm/sdr/0/rx/frequency",  { dev_m2_lm6_1_sdr_rx_freq_set, NULL }},
+-    { "/dm/sdr/0/tx/frequency",  { dev_m2_lm6_1_sdr_tx_freq_set, NULL }},
++    { "/dm/sdr/0/rx/frequency/lob",{ dev_m2_lm6_1_sdr_rx_freq_lob_set, usdr_applied_get }},
++    { "/dm/sdr/0/rx/frequency",  { dev_m2_lm6_1_sdr_rx_freq_set, usdr_applied_get }},
++    { "/dm/sdr/0/tx/frequency",  { dev_m2_lm6_1_sdr_tx_freq_set, usdr_applied_get }},
+     { "/dm/sdr/0/rx/frequency/bb", { dev_m2_lm6_1_sdr_rx_freqbb_set, NULL }},
+     { "/dm/sdr/0/tx/frequency/bb", { dev_m2_lm6_1_sdr_tx_freqbb_set, NULL }},
+ 
+     /* TODO: delete block below after several releases, these are just aliases to above due typo for compatibility with old code */
+-    { "/dm/sdr/0/rx/freqency/lob",{ dev_m2_lm6_1_sdr_rx_freq_lob_set, NULL }},
+-    { "/dm/sdr/0/rx/freqency",  { dev_m2_lm6_1_sdr_rx_freq_set, NULL }},
+-    { "/dm/sdr/0/tx/freqency",  { dev_m2_lm6_1_sdr_tx_freq_set, NULL }},
++    { "/dm/sdr/0/rx/freqency/lob",{ dev_m2_lm6_1_sdr_rx_freq_lob_set, usdr_applied_get }},
++    { "/dm/sdr/0/rx/freqency",  { dev_m2_lm6_1_sdr_rx_freq_set, usdr_applied_get }},
++    { "/dm/sdr/0/tx/freqency",  { dev_m2_lm6_1_sdr_tx_freq_set, usdr_applied_get }},
+ 
+     { "/dm/sdr/0/rx/gain",      { dev_m2_lm6_1_sdr_rx_gain_set, NULL }},
+     { "/dm/sdr/0/tx/gain",      { dev_m2_lm6_1_sdr_tx_gain_set, NULL }},
+@@ -274,16 +277,16 @@ const usdr_dev_param_func_t s_fparams_m2_lm6_1_rev000[] = {
+     { "/dm/sdr/0/rx/gain/vga2b",{ dev_m2_lm6_1_sdr_rx_gainvga2b_set, NULL }},
+     { "/dm/sdr/0/rx/gain/lna",  { dev_m2_lm6_1_sdr_rx_gainlna_set, NULL }},
+ 
+-    { "/dm/sdr/0/rx/gain/auto",  { dev_m2_lm6_1_sdr_rx_gainauto_set, NULL }},
++    { "/dm/sdr/0/rx/gain/auto",  { dev_m2_lm6_1_sdr_rx_gainauto_set, usdr_applied_get }},
+     { "/dm/sdr/0/tx/gain/auto",  { dev_m2_lm6_1_sdr_tx_gainauto_set, NULL }},
+ 
+-    { "/dm/sdr/0/rx/path",      { dev_m2_lm6_1_sdr_rx_path_set, NULL }},
++    { "/dm/sdr/0/rx/path",      { dev_m2_lm6_1_sdr_rx_path_set, usdr_applied_get }},
+     { "/dm/sdr/0/tx/path",      { dev_m2_lm6_1_sdr_tx_path_set, NULL }},
+ 
+     { "/dm/sdr/0/rx/dccorrmode",  { dev_m2_lm6_1_sdr_rx_dccorrmode_set, NULL }},
+ 
+-    { "/dm/sdr/0/rx/bandwidth", { dev_m2_lm6_1_sdr_rx_bandwidth_set, NULL }},
+-    { "/dm/sdr/0/tx/bandwidth", { dev_m2_lm6_1_sdr_tx_bandwidth_set, NULL }},
++    { "/dm/sdr/0/rx/bandwidth", { dev_m2_lm6_1_sdr_rx_bandwidth_set, usdr_applied_get }},
++    { "/dm/sdr/0/tx/bandwidth", { dev_m2_lm6_1_sdr_tx_bandwidth_set, usdr_applied_get }},
+ 
+     { "/dm/sdr/0/tx/phgaincorr", {  dev_m2_lm6_1_sdr_tx_phgaincorr_set, NULL }},
+     { "/dm/sdr/0/rx/phgaincorr", {  dev_m2_lm6_1_sdr_rx_phgaincorr_set, NULL }},
+@@ -394,17 +397,35 @@ typedef struct param_list_idx param_list_idx_t;
+ //     { "rx_auto", USDR_RX_AUTO },
+ // };
+ 
+-#if 0
+-static int find_param_list(const char* param, const param_list_idx_t* lst, unsigned size)
+-{
+-    for (unsigned i = 0; i < size; i++) {
+-        if (strcasecmp(lst[i].name, param) == 0) {
+-            return i;
+-        }
++static int usdr_applied_get(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t *out)
++{
++    struct usdr_dev *d = &((struct dev_m2_lm6_1 *)ud)->d;
++    const char *path = obj->full_path;
++    if (strstr(path, "/gain/auto")) {
++        int gain;
++        int res = usdr_rfic_get_rx_gain(d, &gain);
++        if (res) return res;
++        *out = gain;
++    } else if (strstr(path, "/path")) {
++        *out = (uintptr_t)(d->rx_rfic_lna == RXPATH_LNA3 ? "EXT" :
++                          d->rx_rfic_lna == RXPATH_LNA1 ? "W" : "H");
++    } else if (!strcmp(path, "/dm/rate/adc")) {
++        *out = d->adc_clk;
++    } else if (strstr(path, "/rate/")) {
++        if (!d->rxbb_decim) return -EINVAL;
++        *out = d->adc_clk / d->rxbb_decim;
++    } else if (strstr(path, "/bandwidth")) {
++        *out = strstr(path, "/tx/") ? d->lms.tx_bandwidth : d->lms.rx_bandwidth;
++    } else if (strstr(path, "/frequency/lob") || strstr(path, "/freqency/lob")) {
++        *out = d->mixer_lo;
++    } else if (strstr(path, "/tx/")) {
++        *out = d->lms.tx_frequency + d->tx_exten_lo;
++    } else {
++        *out = d->lms.rx_frequency - (d->mexir_en ? d->mixer_lo : 0) + d->rx_exten_lo;
+     }
+-    return -1;
++    return 0;
+ }
+-#endif
++
+ 
+ static int _channel_info_string_parse(char* chanlist, unsigned max_chans, unsigned* cinfo)
+ {
+@@ -513,21 +534,16 @@ int dev_m2_lm6_1_sdr_clkmeas_get(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t *ov
+ int dev_m2_lm6_1_sdr_dccorr_get(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t* ovalue)
+ {
+     struct dev_m2_lm6_1 *d = (struct dev_m2_lm6_1 *)ud;
+-    uint32_t v = 0;
+-    int res = dev_gpi_get32(ud->dev, 20, &v);
+-    if (res)
+-        return res;
+-
+-    int16_t i, q;
+-    i = (v >> 0) & 0xffff;
+-    q = (v >> 16) & 0xffff;
+-
+-    USDR_LOG("UDEV", USDR_LOG_WARNING, "%s: DC_AAVG I=%d Q=%d\n", lowlevel_get_devname(d->base.dev), i, q);
+-
+-    *ovalue = v;
+-
+-    usdr_rxdccorr(&d->d, ovalue);
+-    return 0;
++    uint32_t i, q;
++    int res = lowlevel_spi_tr32(ud->dev, 0, 0, 0x7100, &i);
++    res = res ? res : lowlevel_spi_tr32(ud->dev, 0, 0, 0x7200, &q);
++    if (!res) {
++        int16_t vi = (i & 0x40) ? -(i & 63) : (i & 63);
++        int16_t vq = (q & 0x40) ? -(q & 63) : (q & 63);
++        *ovalue = ((uint32_t)(uint16_t)vi << 16) | (uint16_t)vq;
++        d->d.rx_corr.dc_i = vi; d->d.rx_corr.dc_q = vq;
++    }
++    return res;
+ }
+ 
+ int dev_m2_lm6_1_debug_lms6002d_reg_set(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t value)
+@@ -690,7 +706,7 @@ enum {
+ };
+ enum {
+     RATE_MIN =  1000000,
+-    RATE_MAX = 80000000,
++    RATE_MAX = 65000000,
+ };
+ 
+ int dev_m2_lm6_1_rate_set(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t value)
+@@ -932,10 +948,12 @@ int dev_m2_lm6_1_sdr_rx_dccorr_set(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t v
+     struct dev_m2_lm6_1 *d = (struct dev_m2_lm6_1 *)ud;
+     int res;
+     //unsigned chan = (unsigned)(value >> 32);
+-    unsigned vi = (value >> 16) & 0xffff;
+-    unsigned vq = (value >> 0) & 0xffff;
++    int vi = (int16_t)(value >> 16);
++    int vq = (int16_t)value;
++    if (vi < -63 || vi > 63 || vq < -63 || vq > 63) return -ERANGE;
+ 
+     res = lms6002d_set_rxfedc(&d->d.lms, vi, vq);
++    if (!res) { d->d.rx_corr.dc_i = vi; d->d.rx_corr.dc_q = vq; }
+     return res;
+ }
+ 
+@@ -944,8 +962,9 @@ int dev_m2_lm6_1_sdr_rx_ip2corr_set(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t
+     struct dev_m2_lm6_1 *d = (struct dev_m2_lm6_1 *)ud;
+     int res;
+     //unsigned chan = (unsigned)(value >> 32);
+-    unsigned vi = (value >> 16) & 0xffff;
+-    unsigned vq = (value >> 0) & 0xffff;
++    int vi = (int16_t)(value >> 16);
++    int vq = (int16_t)value;
++    if (vi < -63 || vi > 63 || vq < -63 || vq > 63) return -ERANGE;
+ 
+     res = lms6002d_set_rxfe_ip2corr(&d->d.lms, vi, vq);
+     return res;
+@@ -981,24 +1000,8 @@ int dev_m2_lm6_1_sdr_rx_tia_rfb_set(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t
+ 
+ int dev_m2_lm6_1_sdr_rx_dc_meas_get(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t* ovalue)
+ {
+-#if 0
+     struct dev_m2_lm6_1 *d = (struct dev_m2_lm6_1 *)ud;
+-    int res;
+-    uint32_t vi, vq;
+-
+-    res = dev_gpi_get32(d->base.dev, IGPI_RX_I, &vi);
+-    if (res)
+-        return res;
+-    res = dev_gpi_get32(d->base.dev, IGPI_RX_Q, &vq);
+-    if (res)
+-        return res;
+-
+-    uint64_t v = (( (uint64_t)vi ) << 32 ) | vq;
+-    *ovalue = v;
+-    return 0;
+-#endif
+-    *ovalue = 0;
+-    return 0;
++    return usdr_rxdccorr(&d->d, ovalue);
+ }
+ 
+ static int _phgaincorr_set(struct dev_m2_lm6_1 *d, bool tx, uint64_t value)
+@@ -1007,10 +1010,11 @@ static int _phgaincorr_set(struct dev_m2_lm6_1 *d, bool tx, uint64_t value)
+     unsigned qg = ((value >> 16) & 0xffff);
+     int32_t pcorr = (int16_t)((value >> 48) & 0xffff);
+     int amp_imb;
++    if (ig > 2047 || qg > 2047) return -ERANGE;
+     if (ig < 2047) {
+         amp_imb = (2047 - ig) * 8;
+     } else {
+-        amp_imb = - (2047 - qg) * 8;
++        amp_imb = -(int)(2047 - qg) * 8;
+     }
+     pcorr *= 16;
+     USDR_LL_LOG(d->base.dev, "UDEV", USDR_LOG_WARNING, "%cXGAC I=%d Q=%d A=%d => AMP_IMB=%d\n",
+@@ -1263,43 +1267,43 @@ int usdr_device_m2_lm6_1_create_stream(device_t* dev, const char* sid, const cha
+         }
+         res = usdr_rfic_streaming_up(&d->d, RFIC_LMS6_RX);
+         if (res) {
+-            return res;
++            goto rx_failed;
+         }
+ 
+         if (d->d.rx_lo == 0) {
+             res = usdr_rfic_fe_set_freq(&d->d, FE_FREQ_LO_RX, ~0U, 320e6, NULL);
+             if (res) {
+-                return res;
++                goto rx_failed;
+             }
+ 
+             d->d.rx_lo = 0;
+         }
+ 
+         res = usdr_calib_dc(&d->d, true);
++        res = res ? res : usdr_rxupdate_cal(&d->d);
+         if (res) {
+-            return res;
+-        }
+-        if (d->d.tx_lo) {
+-            lms6002d_tune_pll(&d->d.lms, true, d->d.tx_lo);
+-        }
+-
+-        for (unsigned i = 0; i < MAX_NCO_STREAMS; i++) {
+-            if (d->d.rx_raw.lo[i].set) {
+-                usdr_rfic_fe_set_freq(&d->d, FE_FREQ_BB_RX, 1 << i, d->d.rx_raw.lo[i].value, NULL);
+-            }
++            goto rx_failed;
+         }
+-
+         res = create_sfetrx4_stream(dev, CORE_SFERX_DMA32_R0, dformat, channels->count, &lchans, pktsyms,
+                                     flags, M2PCI_REG_WR_RXDMA_CONFIRM, VIRT_CFG_SFX_BASE, 0,
+                                     SRF4_FIFOBSZ, CSR_RFE4_BASE, &d->rx, &chans);
+         if (res) {
+-            return res;
++            goto rx_failed;
++        }
++        res = d->rx->ops->option_set(d->rx, "rx-overflow-reg", 20);
++        if (res) {
++            if (!d->rx->ops->destroy(d->rx)) d->rx = NULL;
++            goto rx_failed;
+         }
+         d->d.rx_lchans = chans;
+         *out_handle = d->rx;
+ 
+-        // TODO: handle NCO changes
+-        res = res ? res : usdr_rxupdate_cal(&d->d);
++        return 0;
++rx_failed:
++        // Retain any allocation whose teardown failed for device-close retry.
++        // Do not publish a stream handle after failed calibration or setup.
++        usdr_rfic_streaming_down(&d->d, RFIC_LMS6_RX);
++        return res;
+     } else if (strstr(sid, "tx") != NULL) {
+         bool extended_core = (d->d.hwid & (1 << (24 + 2))) ? true : false;
+ 
+@@ -1308,13 +1312,17 @@ int usdr_device_m2_lm6_1_create_stream(device_t* dev, const char* sid, const cha
+         }
+         res = usdr_rfic_streaming_up(&d->d, RFIC_LMS6_TX);
+         if (res) {
+-            return res;
++            goto tx_failed;
+         }
+ 
+         if (extended_core) {
+             res = res ? res : usdr_reset_txfex(&d->d);
+         }
+ 
++        res = res ? res : usdr_tx_gen_set(&d->d, false, 0, 0, 0);
++        if (d->d.has_txchain)
++            res = res ? res : usdr_txupdate_cal(&d->d);
++
+         res = res ? res : create_sfetrx4_stream(dev, extended_core ? CORE_EXFETX_DMA32_R0_2 : CORE_SFETX_DMA32_R0, dformat, channels->count, &lchans, pktsyms,
+                             flags,
+                             extended_core ? M2PCI_REG_WR_TXDMA_CFG0 : M2PCI_REG_WR_TXDMA_CNF_L,
+@@ -1322,14 +1330,15 @@ int usdr_device_m2_lm6_1_create_stream(device_t* dev, const char* sid, const cha
+                             M2PCI_REG_RD_TXDMA_STAT,
+                             0, CSR_TFE4_BASE, &d->tx, &chans);
+         if (res) {
+-            return res;
++            goto tx_failed;
+         }
+         d->d.tx_lchans = chans;
+         *out_handle = d->tx;
+ 
+-        // TODO: handle NCO changes
+-        res = res ? res : usdr_tx_gen_set(&d->d, false, 0, 0, 0);
+-        res = res ? res : usdr_txupdate_cal(&d->d);
++        return 0;
++tx_failed:
++        usdr_rfic_streaming_down(&d->d, RFIC_LMS6_TX);
++        return res;
+     }
+ 
+     return res;
+@@ -1339,22 +1348,20 @@ static
+ int usdr_device_m2_lm6_1_unregister_stream(device_t* dev, stream_handle_t* stream)
+ {
+     struct dev_m2_lm6_1 *d = (struct dev_m2_lm6_1 *)dev;
+-    if (stream == d->tx) {
+-        usdr_rfic_streaming_down(&d->d, RFIC_LMS6_TX);
+-        d->tx->ops->destroy(d->tx);
+-        d->tx = NULL;
+-        d->d.tx_lchans = 0;
+-    } else if (stream == d->rx) {
+-        usdr_rfic_streaming_down(&d->d, RFIC_LMS6_RX);
+-        d->rx->ops->destroy(d->rx);
+-        d->rx = NULL;
+-        d->d.rx_lchans = 0;
+-    } else {
+-        return -EINVAL;
+-    }
++    bool rx = stream == d->rx;
++    if (!rx && stream != d->tx) return -EINVAL;
++    int res = stream->ops->op(stream, USDR_DMS_STOP, 0);
++    if (res) return res;
++    res = usdr_rfic_streaming_down(&d->d, rx ? RFIC_LMS6_RX : RFIC_LMS6_TX);
++    if (res) return res;
++    res = stream->ops->destroy(stream);
++    if (res) return res;
++    if (rx) { d->rx = NULL; d->d.rx_lchans = 0; }
++    else { d->tx = NULL; d->d.tx_lchans = 0; }
+     return 0;
+ }
+ 
++
+ static int usdr_device_m2_lm6_1_sync(device_t* dev,
+                                      stream_handle_t** pstreams,
+                                      unsigned stream_count,
+diff --git a/src/lib/device/m2_lm6_1/usdr_ctrl.c b/src/lib/device/m2_lm6_1/usdr_ctrl.c
+index 46382a8..4041bba 100644
+--- a/src/lib/device/m2_lm6_1/usdr_ctrl.c
++++ b/src/lib/device/m2_lm6_1/usdr_ctrl.c
+@@ -271,7 +271,6 @@ static int _usdr_set_lna_rx(usdr_dev_t *d, unsigned cfg_idx)
+     unsigned txlbband = 0;
+     int res;
+ 
+-    d->rx_cfg_path = cfg_idx;
+ 
+     USDR_LOG("UDEV", USDR_LOG_INFO, "%s: Set RX band to %d (%s/%s) %s [TXLB:%d => ATEEN=%d,%d]\n",
+              lowlevel_get_devname(d->base.dev), band,
+@@ -279,16 +278,25 @@ static int _usdr_set_lna_rx(usdr_dev_t *d, unsigned cfg_idx)
+              /* d->rx_lna_lb_active ? "loopback enabled" : */ "",
+              txlbband, 0, 0 /* d->trf_lb_atten, d->trf_lb_loss */ );
+ 
+-    res = lms6002d_set_rx_path(&d->lms, ((d->rx_rfic_lna = band)));
++    res = lms6002d_set_rx_path(&d->lms, band);
+     if (res)
+         return res;
+ 
+-    return usdr_set_rx_port_switch(d, /*d->rx_lna_lb_active ? cfg->swlb :*/ cfg->sw);
++    res = usdr_set_rx_port_switch(d, cfg->sw);
++    if (!res) {
++        d->rx_cfg_path = cfg_idx;
++        d->rx_rfic_lna = band;
++    }
++    return res;
+ }
+ 
+ static int _usdr_set_nco(usdr_dev_t *d, bool rx, unsigned nco_num, double freq)
+ {
++    if (!(rx ? d->has_rxchain : d->has_txchain))
++        return freq == 0 ? 0 : -EOPNOTSUPP;
+     unsigned raw_rate = (rx) ? d->adc_clk : d->dac_clk;
++    if (!raw_rate || !isfinite(freq) || nco_num >= MAX_NCO_STREAMS || fabs(freq) >= raw_rate / 2.0)
++        return -ERANGE;
+     double rel_f = freq / raw_rate; // [-1 .. 1]
+     if ((rel_f > 1) || (rel_f < -1)) {
+         USDR_LOG("UDEV", USDR_LOG_WARNING, "NCO_%s_%d: Frequency %.0f is out of ADC/DAC range %u!\n",
+@@ -296,8 +304,7 @@ static int _usdr_set_nco(usdr_dev_t *d, bool rx, unsigned nco_num, double freq)
+ 
+         rel_f = -1;
+     }
+-    int32_t nco_freq = rel_f * INT_MAX;
+-    nco_freq <<= 1;
++    uint32_t nco_freq = (uint32_t)(int64_t)llround(rel_f * 4294967296.0);
+     unsigned reg = rx ? REG_CFG_PHY_0 : REG_CFG_PHY_1;
+     unsigned off = 8 + 2 * nco_num;
+     int res = 0;
+@@ -325,9 +332,8 @@ enum {
+ int usdr_tx_gen_set(usdr_dev_t *d, bool enable, unsigned chanmsk, int16_t i, int16_t q)
+ {
+     int res = 0;
+-    res = res ? res : lowlevel_reg_wr32(d->base.dev, 0, REG_CFG_PHY_1, MAKE_PHY_WR_SUB_REG(CFG_REG_DC_GEN, CFG_REG_DC_GEN_CTRL, enable ? 1 : 0));
+     if (!enable)
+-        return res;
++        return lowlevel_reg_wr32(d->base.dev, 0, REG_CFG_PHY_1, MAKE_PHY_WR_SUB_REG(CFG_REG_DC_GEN, CFG_REG_DC_GEN_CTRL, 0));
+ 
+     if (chanmsk & 1) {
+         res = res ? res : lowlevel_reg_wr32(d->base.dev, 0, REG_CFG_PHY_1, MAKE_PHY_WR_SUB_REG(CFG_REG_DC_GEN, CFG_REG_DC_GEN_AI, i));
+@@ -337,7 +343,8 @@ int usdr_tx_gen_set(usdr_dev_t *d, bool enable, unsigned chanmsk, int16_t i, int
+         res = res ? res : lowlevel_reg_wr32(d->base.dev, 0, REG_CFG_PHY_1, MAKE_PHY_WR_SUB_REG(CFG_REG_DC_GEN, CFG_REG_DC_GEN_BI, i));
+         res = res ? res : lowlevel_reg_wr32(d->base.dev, 0, REG_CFG_PHY_1, MAKE_PHY_WR_SUB_REG(CFG_REG_DC_GEN, CFG_REG_DC_GEN_BQ, q));
+     }
+-    return res;
++    return res ? res : lowlevel_reg_wr32(d->base.dev, 0, REG_CFG_PHY_1,
++        MAKE_PHY_WR_SUB_REG(CFG_REG_DC_GEN, CFG_REG_DC_GEN_CTRL, 1));
+ }
+ 
+ static int _usdr_set_lna_tx(usdr_dev_t *d, unsigned cfg_idx)
+@@ -361,18 +368,23 @@ static int _usdr_pwr_state(usdr_dev_t *d, bool tx, bool enable)
+ {
+     int res = 0;
+ 
+-    if ((tx) && (d->tx_pwren != enable)) {
++    // Always write power-down: a failed power-up may have applied only part of
++    // the sequence, while the cached successful state still says powered off.
++    if ((tx) && (d->tx_pwren != enable || !enable)) {
+         res = lms6002d_trf_enable(&d->lms, enable);
+-        d->tx_pwren = enable;
++        if (!res) d->tx_pwren = enable;
+         USDR_LOG("UDEV", USDR_LOG_INFO, "TX POWER %d\n", d->tx_pwren);
+         usleep(25000);
+ 
+-    } else if ((!tx) && (d->rx_pwren != enable)) {
++    } else if ((!tx) && (d->rx_pwren != enable || !enable)) {
+         res = lms6002d_rfe_enable(&d->lms, enable);
+-        d->rx_pwren = enable;
+         USDR_LOG("UDEV", USDR_LOG_INFO, "RX POWER %d\n", d->rx_pwren);
+ 
+-        res = res ? res : lms6002d_rxvga2_enable(&d->lms, enable);
++        if (!res || !enable) {
++            int vga_res = lms6002d_rxvga2_enable(&d->lms, enable);
++            if (!res) res = vga_res;
++        }
++        if (!res) d->rx_pwren = enable;
+         usleep(25000);
+     }
+ 
+@@ -386,7 +398,8 @@ static int _usdr_signal_event(usdr_dev_t *d, enum sigtype t)
+ 
+     switch (t) {
+     case USDR_RX_LO_CHANGED:
+-        _usdr_pwr_state(d, false, true);
++        res = _usdr_pwr_state(d, false, true);
++        if (res) return res;
+     case USDR_RX_LNA_CHANGED:
+         if (d->rx_rfic_path == USDR_RX_AUTO) {
+             cfgidx = get_antenna_cfg_by_freq(d->rx_lo, d->cfg_auto_rx, USDR_MAX_RX_BANDS);
+@@ -397,7 +410,8 @@ static int _usdr_signal_event(usdr_dev_t *d, enum sigtype t)
+         }
+         return res;
+     case USDR_TX_LO_CHANGED:
+-        _usdr_pwr_state(d, true, true);
++        res = _usdr_pwr_state(d, true, true);
++        if (res) return res;
+     case USDR_TX_LNA_CHANGED:
+         if (d->tx_rfic_path == USDR_TX_AUTO) {
+             cfgidx = get_antenna_cfg_by_freq(d->tx_lo, d->cfg_auto_tx, USDR_MAX_TX_BANDS);
+@@ -409,7 +423,7 @@ static int _usdr_signal_event(usdr_dev_t *d, enum sigtype t)
+         return res;
+ 
+     case USDR_SAMPLERATE_CHANGED:
+-        if (d->mexir_en && (d->cfg_auto_rx[d->rx_cfg_path].band == RXPATH_LNA3)) {
++        if (d->mexir_en && d->rx_lo && d->rx_cfg_path < USDR_MAX_RX_BANDS) {
+             d->rfic_rx_lo = d->mixer_lo + d->rx_lo;
+             USDR_LOG("UDEV", USDR_LOG_ERROR, "%s: RX LO corrected to %.3f -> %.3f Mhz (LNB = %.3f)\n",
+                      lowlevel_get_devname(d->base.dev), d->rx_lo / 1.0e6, d->rfic_rx_lo / 1.0e6, d->mixer_lo / 1.0e6);
+@@ -423,22 +437,20 @@ static int _usdr_signal_event(usdr_dev_t *d, enum sigtype t)
+ 
+ int usdr_set_lob_freq(struct usdr_dev *d, unsigned freqlob)
+ {
+-    if (d->si_vco_freq == 0 || d->rawsamplerate == 0)
++    if (!d->si_vco_freq || !d->adc_clk || !freqlob || !d->rxbb_decim || !d->txbb_intr)
+         return -EINVAL;
+-    if (freqlob == 0)
+-        return -EINVAL;
+-
+-    float ceff = d->si_vco_freq / freqlob;
+-    if (ceff < 8)
+-        ceff = 8;
+-
+-    unsigned div = (unsigned)(ceff + 0.5);
+-    if (div == d->si_vco_div) {
++    unsigned div = ((uint64_t)d->si_vco_freq + freqlob / 2) / freqlob;
++    if (div < 8 || div > 255)
++        return -ERANGE;
++    if (div == d->si_vco_div)
+         return 0;
+-    }
+-
+-    d->si_vco_div = div;
+-    return usdr_set_samplerate_ex(d, d->rawsamplerate, d->rawsamplerate, 0, 0, 0);
++    struct usdr_dev next = *d;
++    next.si_vco_div = div;
++    int res = usdr_set_samplerate_ex(&next, d->adc_clk / d->rxbb_decim,
++                                    d->dac_clk / d->txbb_intr, 0, 0, 0);
++    if (!res)
++        *d = next;
++    return res;
+ }
+ 
+ #define TARGET_RATE 30720000
+@@ -446,7 +458,8 @@ int usdr_set_lob_freq(struct usdr_dev *d, unsigned freqlob)
+ 
+ int usdr_set_rxdccorr(usdr_dev_t *d, bool enable)
+ {
+-    return lowlevel_reg_wr32(d->base.dev, 0, REG_CFG_PHY_0, MAKE_PHY_WR_REG(CFG_REG_DCCTRL, enable));
++    (void)d;
++    return enable ? -EOPNOTSUPP : 0;
+ }
+ 
+ int usdr_reset_txfex(struct usdr_dev *d)
+@@ -478,7 +491,7 @@ static void usdr_calc_iqimb(struct imb_data *d, int32_t imbd_data[4])
+     // c = math.cos(phi / 2.0)
+     // s = math.sin(phi / 2.0)
+     // I = (c / alpha) * Id + (s / beta) * Qd
+-    // Q = (c / beta)  * Qd -(s / alpha) * Id
++    // Q = (c / beta)  * Qd +(s / alpha) * Id
+ 
+     float c = cos(M_PI_4 * d->pahse / IMB_PHASE_MAX);
+     float s = sin(M_PI_4 * d->pahse / IMB_PHASE_MAX);
+@@ -501,7 +514,7 @@ static void usdr_calc_iqimb(struct imb_data *d, int32_t imbd_data[4])
+     float fcfg_amp_i = scale * c * alpha;
+     float fcfg_amp_q = scale * c * beta;
+     float fcfg_tan_q = scale * s * beta;
+-    float fcfg_tan_i = - scale * s * alpha;
++    float fcfg_tan_i = scale * s * alpha; // Symmetric shear corrects quadrature error.
+ 
+     int32_t dsp_amp_max = 8388607;
+     imbd_data[0] = dsp_amp_max * fcfg_amp_i;
+@@ -531,6 +544,7 @@ int usdr_rxupdate_cal(struct usdr_dev *d)
+ 
+ int usdr_txupdate_cal(struct usdr_dev *d)
+ {
++    if (!d->has_txchain) return -EOPNOTSUPP;
+     int32_t imbd_data[4];
+     int res = 0;
+ 
+@@ -553,7 +567,7 @@ int usdr_txupdate_cal(struct usdr_dev *d)
+     // c = math.cos(phi / 2.0)
+     // s = math.sin(phi / 2.0)
+     // I = (c / alpha) * Id + (s / beta) * Qd
+-    // Q = (c / beta)  * Qd -(s / alpha) * Id
++    // Q = (c / beta)  * Qd +(s / alpha) * Id
+ 
+     float c = cos(M_PI_4 * d->tx_corr.pahse / IMB_PHASE_MAX);
+     float s = sin(M_PI_4 * d->tx_corr.pahse / IMB_PHASE_MAX);
+@@ -576,7 +590,7 @@ int usdr_txupdate_cal(struct usdr_dev *d)
+     float fcfg_amp_i = scale * c * alpha;
+     float fcfg_amp_q = scale * c * beta;
+     float fcfg_tan_q = scale * s * beta;
+-    float fcfg_tan_i = - scale * s * alpha;
++    float fcfg_tan_i = scale * s * alpha; // Symmetric shear corrects quadrature error.
+ 
+     int32_t dsp_amp_max = 8388607;
+     int32_t cfg_amp_i = dsp_amp_max * fcfg_amp_i;
+@@ -627,12 +641,15 @@ static int _usdr_update_bandwidth(struct usdr_dev *d, bool istx)
+     return lms6002d_set_bandwidth(&d->lms, istx, bw);
+ }
+ 
+-int usdr_set_samplerate_ex(struct usdr_dev *d,
++static int usdr_apply_samplerate(struct usdr_dev *d,
+                            unsigned rxrate, unsigned txrate,
+                            unsigned adcclk, unsigned dacclk,
+                            unsigned flags)
+ {
+     lldev_t dev = d->base.dev;
++    if ((!rxrate && !txrate) || rxrate > 65000000 || txrate > 65000000 || !d->fref ||
++        !d->si_vco_div || (rxrate && txrate && rxrate != txrate))
++        return -EINVAL;
+     unsigned rate = (rxrate == 0) ? txrate : rxrate;
+     struct si5332_layout_info nfo = { d->fref, rate << 1 }; //Link speed x2 sample rate
+     int res = 0;
+@@ -641,7 +658,7 @@ int usdr_set_samplerate_ex(struct usdr_dev *d,
+ 
+     // Use 50MSPS as safe range
+     if (d->has_rxchain && d->has_txchain) {
+-        for (; ind < SIZEOF_ARRAY(int_dec_x); ind++) {
++        for (; ind + 1 < SIZEOF_ARRAY(int_dec_x); ind++) {
+             if (rate * int_dec_x[ind] >= TARGET_RATE) {
+                 if ((rate * int_dec_x[ind] > SAFE_RATE) && (ind > 0))
+                     ind--;
+@@ -654,20 +671,23 @@ int usdr_set_samplerate_ex(struct usdr_dev *d,
+         nfo.out = rate << 1;
+     }
+ 
++    if ((adcclk && adcclk != rate) || (dacclk && dacclk != rate))
++        return -EOPNOTSUPP;
+     if (rate >= 62e6 && !d->vio_boost) {
+         USDR_LOG("UDEV", USDR_LOG_WARNING, "Boosting Vio to get stable samplerates over 60Msps\n");
+ 
+         res = res ? res : lp8758_vout_set(dev, d->subdev, I2C_BUS_LP8758, 3, LMS6_VIO_BOOST);
+-        d->vio_boost = true;
++        if (!res) d->vio_boost = true;
+     } else if (rate < 62e6 && d->vio_boost) {
+         res = res ? res : lp8758_vout_set(dev, d->subdev, I2C_BUS_LP8758, 3, LMS6_VIO_NORM);
+-        d->vio_boost = false;
++        if (!res) d->vio_boost = false;
+     }
+ 
+     res = res ? res : _usdr_pwr_state(d, false, true);
+     res = res ? res : si5332_set_layout(dev, 0, I2C_BUS_SI5332A, &nfo, d->hw_board_rev == USDR_REV_3 ? false : true, d->si_vco_div, &d->si_vco_freq);
+ 
+-    // TODO: Add ability to alter it
++    if (res) return res;
++    rate = nfo.out / 2;
+     d->mixer_lo = d->si_vco_freq / d->si_vco_div;
+     d->rawsamplerate = nfo.out;
+ 
+@@ -691,25 +711,18 @@ int usdr_set_samplerate_ex(struct usdr_dev *d,
+     d->dac_clk = rate;
+     d->adc_clk = rate;
+ 
+-    // Update FE
+-    res = res ? res : lowlevel_reg_wr32(dev, 0, REG_CFG_PHY_0, 1);
+-    res = res ? res : lowlevel_reg_wr32(dev, 0, REG_CFG_PHY_1, 7);
+-    res = res ? res : usleep(10);
+-    res = res ? res : lowlevel_reg_wr32(dev, 0, REG_CFG_PHY_0, 0);
+-    res = res ? res : lowlevel_reg_wr32(dev, 0, REG_CFG_PHY_1, 0);
+-
+-    // DC control
+-    res = res ? res : lowlevel_reg_wr32(dev, 0, REG_CFG_PHY_0, (1 << 24) | 1);
+-    // res = res ? res : lowlevel_reg_wr32(dev, 0, REG_CFG_PHY_1, (1 << 24) | 0);
+-
+-    // Update NCOs
+-    for (unsigned rxgrp = 0; rxgrp < 2; rxgrp++) {
+-        res = res ? res : usdr_restore_nco(d, (rxgrp == 1));
++    // Legacy uSDR has no multichannel NCO/FIR frontend. Only program those
++    // registers on devices that already advertise that chain.
++    if (d->has_rxchain) {
++        res = res ? res : lowlevel_reg_wr32(dev, 0, REG_CFG_PHY_0, 1);
++        res = res ? res : lowlevel_reg_wr32(dev, 0, REG_CFG_PHY_0, 0);
++        res = res ? res : usdr_restore_nco(d, false);
++    }
++    if (d->has_txchain) {
++        res = res ? res : lowlevel_reg_wr32(dev, 0, REG_CFG_PHY_1, 7);
++        res = res ? res : lowlevel_reg_wr32(dev, 0, REG_CFG_PHY_1, 0);
++        res = res ? res : usdr_restore_nco(d, true);
+     }
+-
+-    //uint32_t v = 0;
+-    //res = res ? res : lowlevel_reg_rd32(dev, 0, REG_CFG_PHY_0, &v);
+-    //USDR_LOG("UDEV", USDR_LOG_WARNING, "V=%08x\n", v);
+ 
+     d->rxbb_decim = int_dec_x[ind];
+     d->txbb_intr = int_dec_x[ind];
+@@ -734,6 +747,17 @@ int usdr_set_samplerate_ex(struct usdr_dev *d,
+ }
+ 
+ 
++int usdr_set_samplerate_ex(struct usdr_dev *d, unsigned rxrate, unsigned txrate,
++                          unsigned adcclk, unsigned dacclk, unsigned flags)
++{
++    struct usdr_dev next = *d;
++    int res = usdr_apply_samplerate(&next, rxrate, txrate, adcclk, dacclk, flags);
++    if (!res)
++        *d = next;
++    return res;
++}
++
++
+ int usdr_rfic_streaming_up(struct usdr_dev *d, unsigned dir)
+ {
+     int res = 0;
+@@ -741,14 +765,14 @@ int usdr_rfic_streaming_up(struct usdr_dev *d, unsigned dir)
+ 
+     if (dir & RFIC_LMS6_TX) {
+         wakeup_delay |= !d->tx_run;
+-        d->tx_run = true;
+         res = (res) ? res : _usdr_pwr_state(d, true, true);
++        if (!res) d->tx_run = true;
+     }
+ 
+     if (dir & RFIC_LMS6_RX) {
+         wakeup_delay |= !d->rx_run;
+-        d->rx_run = true;
+         res = (res) ? res : _usdr_pwr_state(d, false, true);
++        if (!res) d->rx_run = true;
+     }
+ 
+     if (wakeup_delay) {
+@@ -765,13 +789,13 @@ int usdr_rfic_streaming_down(struct usdr_dev *d, unsigned dir)
+     int res = 0;
+ 
+     if (dir & RFIC_LMS6_TX) {
+-        d->tx_run = false;
+         res = (res) ? res : _usdr_pwr_state(d, true, false);
++        if (!res) d->tx_run = false;
+     }
+ 
+     if (dir & RFIC_LMS6_RX) {
+-        d->rx_run = false;
+         res = (res) ? res : _usdr_pwr_state(d, false, false);
++        if (!res) d->rx_run = false;
+     }
+ 
+     // TODO disable clock
+@@ -792,22 +816,34 @@ int usdr_ctor(lldev_t dev, subdev_t sub, struct usdr_dev *d)
+     d->rx_rfic_path = USDR_RX_AUTO;
+     d->tx_rfic_path = USDR_TX_AUTO;
+ 
+-    d->rx_corr.amp_corr = AMP_COMP_2CH_0DB; //AMP_COMP_1CH_0DB;
++    d->rx_corr.amp_corr = AMP_COMP_1CH_0DB;
+ 
+     return 0;
+ }
+ 
+ int usdr_set_extref(usdr_dev_t *d, bool ext, uint32_t freq)
+ {
+-    d->fref = d->lms.fref = (ext) ? freq : USDR_INT_REFCLK;
+-
+-    // TODO retrigger samplerate / TX / RX
+-
+-    return si5532_set_ext_clock_sw(d->base.dev, 0, I2C_BUS_SI5332A, ext);
++    if (ext && !freq)
++        return -EINVAL;
++    struct usdr_dev next = *d;
++    next.fref = next.lms.fref = ext ? freq : USDR_INT_REFCLK;
++    next.refclkpath = ext;
++    int res = si5532_set_ext_clock_sw(d->base.dev, 0, I2C_BUS_SI5332A, ext);
++    if (!res && d->adc_clk)
++        res = usdr_set_samplerate_ex(&next, d->adc_clk / d->rxbb_decim,
++                                    d->dac_clk / d->txbb_intr, 0, 0, 0);
++    if (!res && next.rx_lo)
++        res = lms6002d_tune_pll(&next.lms, false, next.rfic_rx_lo);
++    if (!res && next.tx_lo)
++        res = lms6002d_tune_pll(&next.lms, true, next.tx_lo);
++    if (!res)
++        *d = next;
++    return res;
+ }
+ 
+ int usdr_tx_dccorr(usdr_dev_t *d, int16_t i, int16_t q)
+ {
++    if (!d->has_txchain) return -EOPNOTSUPP;
+     uint32_t val = ((((uint16_t)q) & 0xfff) << 12) | (((uint16_t)i) & 0xfff);
+     return lowlevel_reg_wr32(d->lms.dev, 0, REG_CFG_PHY_1, (1 << 24) | val);
+ }
+@@ -984,6 +1020,8 @@ int usdr_init(struct usdr_dev *d, int ext_clk, unsigned ext_fref)
+     res = si5332_init(dev, 0, I2C_BUS_SI5332A, 1,
+                       ext_clk == -1 ? (d->hw_board_rev == USDR_REV_3 ? false : true) : ext_clk,
+                       d->hw_board_rev == USDR_REV_3 ? true : false);
++    if (res)
++        goto fail;
+ 
+     if (d->hw_board_rev == USDR_REV_3) {
+         res = dev_gpo_set(dev, IGPO_ENABLE_OSC, ext_clk == 1 ? 0 : 1);
+@@ -1024,7 +1062,9 @@ int usdr_init(struct usdr_dev *d, int ext_clk, unsigned ext_fref)
+     res = res ? res : lms6002d_set_rx_path(&d->lms, d->cfg_auto_rx[1].band);
+     res = res ? res : lms6002d_set_tx_path(&d->lms, d->cfg_auto_tx[0].band);
+ 
+-    res = res ? res : dev_gpo_set(dev, IGPO_DCCORR, 1);
++    res = res ? res : dev_gpo_set(dev, IGPO_DCCORR, 0);
++    if (res)
++        goto fail;
+     return res;
+ 
+ fail:
+@@ -1046,28 +1086,136 @@ int usdr_dtor(struct usdr_dev *d)
+     return 0;
+ }
+ 
+-static int _usdr_lms6002_dc_calib_rx(struct usdr_dev *d)
++static int usdr_lms_read(usdr_dev_t *d, unsigned reg, uint8_t *value)
+ {
+-    int res = 0;
++    uint32_t v;
++    int res = lowlevel_spi_tr32(d->lms.dev, d->lms.subdev, d->lms.lsaddr, reg << 8, &v);
++    if (!res) *value = v;
++    return res;
++}
++
++static int usdr_lms_write(usdr_dev_t *d, unsigned reg, uint8_t value)
++{
++    int res = lowlevel_spi_tr32(d->lms.dev, d->lms.subdev, d->lms.lsaddr,
++                              0x8000 | (reg << 8) | value, NULL);
++    if (!res && reg == 0x71) d->lms.rfe_in1sel_dci = value;
++    return res;
++}
+ 
+-    res = res ? res : lms6002d_cal_lpf(&d->lms);
++static void usdr_cleanup_error(int *res, int cleanup)
++{
++    if (cleanup) {
++        USDR_LOG("UDEV", USDR_LOG_ERROR, "Calibration cleanup failed: %d\n", cleanup);
++        if (!*res) *res = cleanup;
++    }
++}
+ 
+-    for (unsigned i = 0; i < 16; i++) {
+-        res = res ? res : lms6002d_cal_lpf_bandwidth(&d->lms, i, i == 0);
++// One finite 65536-sample window; raw mode bypasses the IQ matrix and NCO.
++static int usdr_measure(usdr_dev_t *d, bool raw, int32_t mean[2])
++{
++    if (!d->adc_clk) return -EINVAL;
++    int32_t before, after, clipped;
++    int res = lowlevel_reg_wr32(d->base.dev, 0, REG_CFG_PHY_0,
++                                MAKE_PHY_WR_SUB_REG(CFG_REG_DC_EST, 8, raw));
++    res = res ? res : phy_dc_estim_start(d->base.dev, REG_CFG_PHY_0, false);
++    res = res ? res : phy_dc_estim_get(d->base.dev, REG_CFG_PHY_0, DC_ESTIM_GEN, &before);
++    res = res ? res : phy_dc_estim_start(d->base.dev, REG_CFG_PHY_0, true);
++    if (res) return res;
++    // Allows slow supported rates and host scheduling delays; finite on a stopped ADC.
++    unsigned polls = 200 + (65536000ull / d->adc_clk);
++    for (unsigned k = 0; k < polls; ++k) {
++        res = phy_dc_estim_get(d->base.dev, REG_CFG_PHY_0, DC_ESTIM_GEN, &after);
++        if (res) return res;
++        if (after != before) {
++            res = phy_dc_estim_get(d->base.dev, REG_CFG_PHY_0, (enum dc_estimations)1, &clipped);
++            res = res ? res : phy_dc_estim_get(d->base.dev, REG_CFG_PHY_0, DC_ESTIM_AI, &mean[0]);
++            res = res ? res : phy_dc_estim_get(d->base.dev, REG_CFG_PHY_0, DC_ESTIM_AQ, &mean[1]);
++            return res ? res : clipped ? -EOVERFLOW : 0;
++        }
++        usleep(1000);
+     }
++    return -ETIMEDOUT;
++}
+ 
+-    res = res ? res : lms6002d_cal_txrxlpfdc(&d->lms, true);
+-    res = res ? res : lms6002d_set_rx_extterm(&d->lms, true);
++static int usdr_rx_dc_candidate(usdr_dev_t *d, int code[2], unsigned axis, int candidate, int64_t *cost)
++{
++    int trial[2] = {code[0], code[1]};
++    trial[axis] = candidate;
++    int res = lms6002d_set_rxfedc(&d->lms, trial[0], trial[1]);
++    if (res) return res;
++    usleep(1000); // Allow the analog chain to settle before opening the measurement window.
++    int32_t mean[2];
++    res = usdr_measure(d, true, mean);
++    if (res == -EOVERFLOW) { *cost = INT64_MAX; return 0; }
++    if (!res) *cost = llabs((int64_t)mean[axis]);
++    return res;
++}
+ 
+-    //TODO Set path to 1
++// Explicit quiet-input calibration; never track offsets on a live signal.
++static int usdr_calibrate_rx_dc(usdr_dev_t *d)
++{
++    if (d->tx_run || !d->rx_pwren || !d->adc_clk) return -EBUSY;
++    uint8_t saved[3];
++    const unsigned regs[] = {0x71, 0x72, 0x7c};
++    for (unsigned n = 0; n < 3; ++n) {
++        int res = usdr_lms_read(d, regs[n], &saved[n]);
++        if (res) return res;
++    }
++    int code[2];
++    for (unsigned n = 0; n < 2; ++n)
++        code[n] = (saved[n] & 0x40) ? -(saved[n] & 63) : (saved[n] & 63);
++    int res = lms6002d_set_rx_extterm(&d->lms, true);
++    const int coarse[] = {-63,-48,-32,-16,0,16,32,48,63};
++    for (unsigned pass = 0; pass < 2 && !res; ++pass) {
++        for (unsigned axis = 0; axis < 2 && !res; ++axis) {
++            int best = code[axis];
++            int64_t bestcost = INT64_MAX, cost;
++            for (unsigned k = 0; k < SIZEOF_ARRAY(coarse) && !res; ++k) {
++                res = usdr_rx_dc_candidate(d, code, axis, coarse[k], &cost);
++                if (!res && cost < bestcost) { best = coarse[k]; bestcost = cost; }
++            }
++            int start = MAX(-63, best - 15), stop = MIN(63, best + 15);
++            for (int k = start; k <= stop && !res; ++k) {
++                res = usdr_rx_dc_candidate(d, code, axis, k, &cost);
++                if (!res && cost < bestcost) { best = k; bestcost = cost; }
++            }
++            if (!res && bestcost == INT64_MAX) res = -EOVERFLOW;
++            code[axis] = best;
++        }
++    }
++    if (!res) res = lms6002d_set_rxfedc(&d->lms, code[0], code[1]);
++    uint8_t selected[2];
++    for (unsigned n = 0; n < 2; ++n)
++        selected[n] = (saved[n] & 0x80) | (code[n] < 0 ? 0x40 | -code[n] : code[n]);
++    bool calibrated = !res;
++    for (unsigned n = 0; n < 3; ++n)
++        usdr_cleanup_error(&res, usdr_lms_write(d, regs[n], calibrated && n < 2 ? selected[n] : saved[n]));
++    if (res) {
++        for (unsigned n = 0; n < 3; ++n)
++            usdr_cleanup_error(&res, usdr_lms_write(d, regs[n], saved[n]));
++    } else {
++        d->rx_corr.dc_i = code[0]; d->rx_corr.dc_q = code[1];
++        USDR_LOG("UDEV", USDR_LOG_INFO, "Analog RX DC codes I=%d Q=%d\n", code[0], code[1]);
++    }
++    return res;
++}
+ 
++static int _usdr_lms6002_dc_calib_rx(struct usdr_dev *d)
++{
++    if (d->tx_run) return -EBUSY;
++    uint8_t route, bias;
++    int res = usdr_lms_read(d, 0x71, &route);
++    res = res ? res : usdr_lms_read(d, 0x7c, &bias);
++    if (res) return res;
++    res = lms6002d_cal_lpf(&d->lms);
++    for (unsigned i = 0; i < 16 && !res; i++)
++        res = lms6002d_cal_lpf_bandwidth(&d->lms, i, i == 0);
++    res = res ? res : lms6002d_cal_txrxlpfdc(&d->lms, true);
++    res = res ? res : lms6002d_set_rx_extterm(&d->lms, true);
+     res = res ? res : lms6002d_cal_txrxlpfdc(&d->lms, false);
+     res = res ? res : lms6002d_cal_vga2(&d->lms);
+-    res = res ? res : lms6002d_set_rx_extterm(&d->lms, false);
+-
+-    // Restore initial VGA2 gain values
+-    res = res ? res : lms6002d_set_rxvga2ab_gain(&d->lms, d->rx_vga2a, d->rx_vga2b);
+-
++    usdr_cleanup_error(&res, usdr_lms_write(d, 0x71, route));
++    usdr_cleanup_error(&res, usdr_lms_write(d, 0x7c, bias));
+     return res;
+ }
+ 
+@@ -1080,17 +1228,21 @@ static int _usdr_lms6002_dc_calib_tx(struct usdr_dev *d)
+     return res;
+ }
+ 
+-int usdr_rfic_fe_set_freq(struct usdr_dev *d,
++static int usdr_apply_frequency(struct usdr_dev *d,
+                           enum fe_freq_type type,
+                           unsigned chmask,
+                           double freq,
+                           double *actualfreq)
+ {
++    if (!isfinite(freq) || !(chmask & ((1u << MAX_NCO_STREAMS) - 1)))
++        return -EINVAL;
+     int res;
+     if (actualfreq) *actualfreq = freq;
+     bool first_tx = (d->tx_lo == 0);
+     bool istx = (type == FE_FREQ_LO_TX) || (type == FE_FREQ_BB_TX);
+     bool islo = (type == FE_FREQ_LO_TX) || (type == FE_FREQ_LO_RX);
++    if (islo ? (freq <= 0 || freq > 3800000000.0) : (fabs(freq) > 65000000))
++        return -ERANGE;
+     freq_data_t* freqd = (istx) ? &d->tx_raw : &d->rx_raw;
+ 
+     for (unsigned i = 0; i < MAX_NCO_STREAMS; i++) {
+@@ -1098,8 +1250,8 @@ int usdr_rfic_fe_set_freq(struct usdr_dev *d,
+             switch (type) {
+             case FE_FREQ_LO_RX: opt_u32_set_val(&d->rx_raw.lo[i], freq); break;
+             case FE_FREQ_LO_TX: opt_u32_set_val(&d->tx_raw.lo[i], freq); break;
+-            case FE_FREQ_BB_RX: opt_u32_set_val(&d->rx_raw.bb[i], freq); break;
+-            case FE_FREQ_BB_TX: opt_u32_set_val(&d->tx_raw.bb[i], freq); break;
++            case FE_FREQ_BB_RX: opt_u32_set_val(&d->rx_raw.bb[i], (uint32_t)(int32_t)freq); break;
++            case FE_FREQ_BB_TX: opt_u32_set_val(&d->tx_raw.bb[i], (uint32_t)(int32_t)freq); break;
+             default:
+                 return -EINVAL;
+             }
+@@ -1146,7 +1298,9 @@ int usdr_rfic_fe_set_freq(struct usdr_dev *d,
+     }
+ 
+     // Apply automatic switch, turn on pwr for RX or TX
+-    _usdr_signal_event(d, istx ? USDR_TX_LO_CHANGED : USDR_RX_LO_CHANGED);
++    res = _usdr_signal_event(d, istx ? USDR_TX_LO_CHANGED : USDR_RX_LO_CHANGED);
++    if (res)
++        return res;
+ 
+     if (!istx) {
+         freq = d->rx_lo;
+@@ -1179,6 +1333,8 @@ int usdr_rfic_fe_set_freq(struct usdr_dev *d,
+         res = lms6002d_tune_pll(&d->lms, istx, freq);
+     }
+     if (res == -ENOLCK) {
++        if (!(istx ? d->has_txchain : d->has_rxchain))
++            return res; // Range extension requires an actual streaming NCO.
+         if (freq < USDR_LO_LOW_RANGE && (istx ? d->tx_minimal_lo == 0 : d->rx_minimal_lo == 0)) {
+             // Try to get low range in order to apply NCO correction to extend range
+             unsigned sweep_lo = freq;
+@@ -1248,28 +1404,39 @@ int usdr_rfic_fe_set_freq(struct usdr_dev *d,
+ }
+ 
+ 
+-int usdr_rfic_bb_set_badwidth(struct usdr_dev *d,
+-                              bool dir_tx,
+-                              unsigned bw,
+-                              unsigned* actualbw)
++int usdr_rfic_fe_set_freq(struct usdr_dev *d, enum fe_freq_type type, unsigned chmask,
++                          double freq, double *actualfreq)
+ {
+-    if (actualbw) *actualbw = bw;
+-
+-    if (!dir_tx) {
+-        if (bw == 0) {
+-            opt_u32_set_null(&d->rx_bw);
+-        } else {
+-            opt_u32_set_val(&d->rx_bw, bw);
+-        }
+-    } else {
+-        if (bw == 0) {
+-            opt_u32_set_null(&d->tx_bw);
+-        } else {
+-            opt_u32_set_val(&d->tx_bw, bw);
++    struct usdr_dev next = *d;
++    double actual;
++    int res = usdr_apply_frequency(&next, type, chmask, freq, &actual);
++    if (!res) {
++        *d = next;
++        if (actualfreq) {
++            if (type == FE_FREQ_LO_RX) actual = (double)d->lms.rx_frequency - (d->mexir_en ? d->mixer_lo : 0) + d->rx_exten_lo;
++            else if (type == FE_FREQ_LO_TX) actual = d->lms.tx_frequency + d->tx_exten_lo;
++            *actualfreq = actual;
+         }
+     }
++    return res;
++}
+ 
+-    return lms6002d_set_bandwidth(&d->lms, dir_tx, bw);
++
++int usdr_rfic_bb_set_badwidth(struct usdr_dev *d, bool dir_tx,
++                              unsigned bw, unsigned* actualbw)
++{
++    opt_u32_t *setting = dir_tx ? &d->tx_bw : &d->rx_bw;
++    int res;
++    if (!bw)
++        res = _usdr_update_bandwidth(d, dir_tx);
++    else
++        res = lms6002d_set_bandwidth(&d->lms, dir_tx, bw);
++    if (!res) {
++        if (bw) opt_u32_set_val(setting, bw);
++        else opt_u32_set_null(setting);
++        if (actualbw) *actualbw = dir_tx ? d->lms.tx_bandwidth : d->lms.rx_bandwidth;
++    }
++    return res;
+ }
+ 
+ static
+@@ -1280,7 +1447,7 @@ int _usdr_gain_clamp(int gain, int gain_min, int gain_max)
+     return gain;
+ }
+ 
+-int usdr_rfic_set_gain(struct usdr_dev *d,
++static int usdr_apply_gain(struct usdr_dev *d,
+                        unsigned gain_type,
+                        int gain,
+                        int *actualgain)
+@@ -1292,7 +1459,12 @@ int usdr_rfic_set_gain(struct usdr_dev *d,
+ 
+     switch (gain_type) {
+     case GAIN_RX_AUTO:
+-        _interpolate_lan_gains(d->rx_lo / 1000000, &dlna1, &dlna2);
++        if (d->rx_rfic_lna == RXPATH_LNA3) {
++            // LNA3 has one documented 6 dB step, without the LNA1/2 bypass.
++            dlna1 = 0; dlna2 = 60;
++        } else {
++            _interpolate_lan_gains(d->rx_lo / 1000000, &dlna1, &dlna2);
++        }
+         ngain = _usdr_gain_clamp(gain, GAIN_RX_AUTO_MIN, GAIN_RX_AUTO_MAX);
+ 
+         if (ngain >= (dlna1 + dlna2 + 5) / 10) {
+@@ -1309,14 +1481,14 @@ int usdr_rfic_set_gain(struct usdr_dev *d,
+         }
+ 
+         if (ngain > 25) {
+-            d->rx_vga2a = ((ngain - 25) + 5) / 6;
+-            d->rx_vga1 = ngain - 6 * d->rx_vga2a;
++            d->rx_vga2a = MIN(10, ((ngain - 25) + 2) / 3);
++            d->rx_vga1 = MIN(25, ngain - 3 * d->rx_vga2a);
+         } else {
+             d->rx_vga2a = 0;
+             d->rx_vga1 = ngain;
+         }
+ 
+-        actual += d->rx_vga1 + 6 * d->rx_vga2a;
++        actual += d->rx_vga1 + 3 * d->rx_vga2a;
+         d->rx_vga2b = 0;
+ 
+         res = lms6002d_set_rxlna_gain(&d->lms, 1 + d->rx_lna);
+@@ -1340,6 +1512,10 @@ int usdr_rfic_set_gain(struct usdr_dev *d,
+             ngain = GAIN_RX_LNA_MIN;
+             val = RXLNAGAIN_BYPASS;
+         }
++        if (d->rx_rfic_lna == RXPATH_LNA3 && val != RXLNAGAIN_MAX) {
++            val = RXLNAGAIN_MID;
++            ngain = GAIN_RX_LNA_MIN;
++        }
+         res = lms6002d_set_rxlna_gain(&d->lms, val);
+         break;
+ 
+@@ -1389,6 +1565,42 @@ int usdr_rfic_set_gain(struct usdr_dev *d,
+     return res;
+ }
+ 
++int usdr_rfic_set_gain(struct usdr_dev *d, unsigned type, int gain, int *actualgain)
++{
++    struct usdr_dev next = *d;
++    int actual;
++    int res = usdr_apply_gain(&next, type, gain, &actual);
++    if (!res) {
++        *d = next;
++        if (actualgain) *actualgain = actual;
++    }
++    return res;
++}
++
++// Nominal gain relative to the minimum setting, not calibrated connector gain.
++// Read the RFIC so quantization and startup/calibration changes are included.
++int usdr_rfic_get_rx_gain(struct usdr_dev *d, int *gain)
++{
++    uint8_t lna, vga1, mode, vga2;
++    int res = usdr_lms_read(d, 0x75, &lna);
++    res = res ? res : usdr_lms_read(d, 0x76, &vga1);
++    res = res ? res : usdr_lms_read(d, 0x64, &mode);
++    res = res ? res : usdr_lms_read(d, (mode & 1) ? 0x68 : 0x65, &vga2);
++    if (res) return res;
++    unsigned code = lna >> 6, dlna1, dlna2;
++    if (((lna >> 4) & 3) == RXPATH_LNA3) {
++        if (code != 2 && code != 3) return -EOPNOTSUPP;
++        dlna1 = 0; dlna2 = 60;
++    } else {
++        if (!code) return -EOPNOTSUPP;
++        _interpolate_lan_gains(d->rx_lo / 1000000, &dlna1, &dlna2);
++    }
++    unsigned lna_db = code == 3 ? (dlna1 + dlna2 + 5) / 10 : code == 2 ? (dlna1 + 5) / 10 : 0;
++    unsigned vga2_db = 3 * ((mode & 1) ? (vga2 & 15) + (vga2 >> 4) : (vga2 & 31));
++    *gain = lna_db + (int)lround(20 * log10(127.0 / (127.5 - (vga1 & 127)))) + vga2_db;
++    return 0;
++}
++
+ 
+ int usdr_rfic_switch_loopback(struct usdr_dev *d, bool lb)
+ {
+@@ -1409,22 +1621,24 @@ int usdr_rfic_switch_loopback(struct usdr_dev *d, bool lb)
+     return res;
+ }
+ 
+-int usdr_rfic_fe_set_rxlna(struct usdr_dev *d,
+-                           const char *lna, bool lb)
++int usdr_rfic_fe_set_rxlna(struct usdr_dev *d, const char *lna, bool lb)
+ {
+-    int res = get_antenna_cfg_by_name(lna, d->cfg_auto_rx, SIZEOF_ARRAY(d->cfg_auto_rx));
+-    USDR_LOG("UDEV", USDR_LOG_INFO, "RX_PATH set to %s from `%s`\n", (res < 0) ? "AUTO" : d->cfg_auto_rx[res].name0, lna);
+-
+-    if (res == -1) {
+-        d->rx_rfic_path = USDR_RX_AUTO;
+-        res = _usdr_signal_event(d, USDR_RX_LNA_CHANGED);
+-        res = res ? res : usdr_rfic_switch_loopback(d, lb);
+-        return res;
++    if (!lna)
++        return -EINVAL;
++    int idx = get_antenna_cfg_by_name(lna, d->cfg_auto_rx, USDR_MAX_RX_BANDS);
++    if (idx < 0 && strcasecmp(lna, "auto"))
++        return -EINVAL;
++    struct usdr_dev next = *d;
++    next.rx_rfic_path = idx < 0 ? USDR_RX_AUTO : (unsigned)idx;
++    unsigned path = idx < 0 ? get_antenna_cfg_by_freq(d->rx_lo, d->cfg_auto_rx, USDR_MAX_RX_BANDS) : (unsigned)idx;
++    int res = _usdr_set_lna_rx(&next, path);
++    if (!res && next.rx_lo) {
++        next.rfic_rx_lo = next.rx_lo + (next.mexir_en ? next.mixer_lo : 0);
++        res = lms6002d_tune_pll(&next.lms, false, next.rfic_rx_lo);
+     }
+-
+-    d->rx_rfic_path = res;
+-    res = _usdr_set_lna_rx(d, d->rx_rfic_path);
+-    res = res ? res : usdr_rfic_switch_loopback(d, lb);
++    res = res ? res : usdr_rfic_switch_loopback(&next, lb);
++    if (!res)
++        *d = next;
+     return res;
+ }
+ 
+@@ -1453,8 +1667,8 @@ int usdr_set_rx_port_switch(struct usdr_dev *d, unsigned path)
+     res = (res) ? res : dev_gpo_set(d->base.dev, IGPO_RXMIX_EN, path >> 1);
+ 
+     if (mixer_en != d->mexir_en) {
+-        d->mexir_en = mixer_en;
+-        res = (res) ? res : si5332_set_port3_en(d->base.dev, 0, I2C_BUS_SI5332A, d->mexir_en, d->tx_run);
++        res = (res) ? res : si5332_set_port3_en(d->base.dev, 0, I2C_BUS_SI5332A, mixer_en, d->tx_run);
++        if (!res) d->mexir_en = mixer_en;
+     }
+     return res;
+ }
+@@ -1470,7 +1684,8 @@ int usdr_calib_dc(struct usdr_dev *d, bool rx)
+     int res;
+     res = rx ? _usdr_lms6002_dc_calib_rx(d) : _usdr_lms6002_dc_calib_tx(d);
+ 
+-    USDR_LOG("UDEV", USDR_LOG_INFO, "DC %s - Calibration done\n", rx ? "RX" : "TX");
++    if (!res && rx) res = usdr_calibrate_rx_dc(d);
++    USDR_LOG("UDEV", USDR_LOG_INFO, "DC %s calibration result: %d\n", rx ? "RX" : "TX", res);
+     return res;
+ }
+ 
+@@ -1484,26 +1699,34 @@ int usdr_gettemp(struct usdr_dev *d, int* temp256)
+ // Calibration
+ int usdr_tx_iqimb_set(usdr_dev_t* d, int iq_amp_imb, int phase_imb)
+ {
+-    d->tx_corr.ampl = (int64_t)iq_amp_imb * IMB_AMPL_MAX / INT16_MAX;
+-    d->tx_corr.pahse = phase_imb;
+-
+-    return usdr_txupdate_cal(d);
++    if (!d->has_txchain) return -EOPNOTSUPP;
++    if (iq_amp_imb < -INT16_MAX || iq_amp_imb > INT16_MAX ||
++        phase_imb < IMB_PHASE_MIN || phase_imb > IMB_PHASE_MAX) return -ERANGE;
++    usdr_dev_t next = *d;
++    next.tx_corr.ampl = (int64_t)iq_amp_imb * IMB_AMPL_MAX / INT16_MAX;
++    next.tx_corr.pahse = phase_imb;
++    int res = usdr_txupdate_cal(&next);
++    if (!res) *d = next;
++    return res;
+ }
+ 
+ int usdr_rx_iqimb_set(usdr_dev_t* d, int iq_amp_imb, int phase_imb)
+ {
+-    d->rx_corr.ampl = (int64_t)iq_amp_imb * IMB_AMPL_MAX / INT16_MAX;
+-    d->rx_corr.pahse = phase_imb;
+-
+-    return usdr_rxupdate_cal(d);
++    if (iq_amp_imb < -INT16_MAX || iq_amp_imb > INT16_MAX ||
++        phase_imb < IMB_PHASE_MIN || phase_imb > IMB_PHASE_MAX) return -ERANGE;
++    usdr_dev_t next = *d;
++    next.rx_corr.ampl = (int64_t)iq_amp_imb * IMB_AMPL_MAX / INT16_MAX;
++    next.rx_corr.pahse = phase_imb;
++    int res = usdr_rxupdate_cal(&next);
++    if (!res) *d = next;
++    return res;
+ }
+ 
+ int usdr_rxdccorr(struct usdr_dev *d, uint64_t *ov)
+ {
+-    int out;
+-    int res = phy_do_meas_nco_avg(d->lms.dev, REG_CFG_PHY_0, 32767, 0, 1, &out);
+-
+-    *ov = out;
++    int32_t mean[2];
++    int res = usdr_measure(d, true, mean);
++    if (!res) *ov = (uint32_t)mean[0] | ((uint64_t)(uint32_t)mean[1] << 32);
+     return res;
+ }
+ 
+@@ -1517,19 +1740,20 @@ int usdr_set_corr_param(usdr_dev_t* d, int channel, int corr_type, int value)
+     switch (type) {
+     case CORR_PARAM_I:
+     case CORR_PARAM_Q:
++        if (rx && (value < -63 || value > 63)) return -ERANGE;
+         USDR_LL_LOG(d->base.dev, "LMS6", USDR_LOG_INFO, "Set %s%s%s to %d\n",
+                     rx ? "RX" : "TX",
+                     (channel == 0) ? "A" : "B",
+                     type == CORR_PARAM_I ? "I" : "Q",
+                     value);
+-        if (type == CORR_PARAM_Q) {
++        if (type == CORR_PARAM_I) {
+             imb_corr->dc_i = value;
+         } else {
+             imb_corr->dc_q = value;
+         }
+ 
+         if (rx) {
+-            return -EINVAL;
++            return lms6002d_set_rxfedc(&d->lms, imb_corr->dc_i, imb_corr->dc_q);
+         } else {
+             return d->cal_txlo_dig ?
+                 usdr_tx_dccorr(d, imb_corr->dc_i, imb_corr->dc_q) :
+@@ -1585,28 +1809,47 @@ static
+ int usdrcal_do_meas_nco_avg(void* param, int channel, unsigned logduration, int* func)
+ {
+     usdr_dev_t *d = (usdr_dev_t *)param;
+-    unsigned acc_idx = 1; //TODO: FIXME: !!!!!!!!!!!!!!!!!!!
++    if (channel != 0 || !func) return -EINVAL;
++    unsigned windows = MAX(1, logduration);
++    if (windows > 64) return -ERANGE;
++    double power = 0;
++    for (unsigned k = 0; k < windows; ++k) {
++        int32_t mean[2];
++        int res = usdr_measure(d, false, mean);
++        if (res) return res;
++        double i = mean[0] / (65536.0 * 32768.0);
++        double q = mean[1] / (65536.0 * 32768.0);
++        power += i*i + q*q;
++    }
++    *func = (int)(10000 * log10(MAX(1e-18, power / windows)));
++    return 0;
++}
+ 
+-    return phy_do_meas_nco_avg(d->lms.dev, REG_CFG_PHY_0, 32767, channel, acc_idx, func);
++static int usdr_cal_nco(usdr_dev_t *d, bool rx, int32_t freq)
++{
++    unsigned rate = rx ? d->adc_clk : d->dac_clk;
++    if (!rate || llabs((int64_t)freq) >= rate / 2) return -ERANGE;
++    uint32_t step = (uint32_t)((int64_t)freq * 4294967296ll / rate);
++    unsigned reg = rx ? REG_CFG_PHY_0 : REG_CFG_PHY_1;
++    uint32_t low = rx ? MAKE_PHY_WR_SUB_REG(6,2,step) : MAKE_PHY_WR_REG(8,step & 0xffff);
++    uint32_t high = rx ? MAKE_PHY_WR_SUB_REG(6,3,step >> 16) : MAKE_PHY_WR_REG(9,step >> 16);
++    int res = lowlevel_reg_wr32(d->base.dev, 0, reg, low);
++    return res ? res : lowlevel_reg_wr32(d->base.dev, 0, reg, high);
+ }
+ 
+-static
+-int usdrcal_set_tx_testsig(void* param, int channel, int32_t freqoffset, unsigned pwr)
++static int usdrcal_set_tx_testsig(void* param, int channel, int32_t freqoffset, unsigned pwr)
+ {
+-    usdr_dev_t *d = (usdr_dev_t *)param;
+-    int res = 0;
+-    int clamp_pwr = (pwr > 30000) ? 30000 : pwr;
+-    res = res ? res : usdr_tx_gen_set(d, pwr == 0 ? false : true, 0x3, clamp_pwr, 0);
+-    res = res ? res : _usdr_set_nco(d, false, 0, freqoffset);
+-    res = res ? res : _usdr_set_nco(d, false, 1, freqoffset);
+-    return res;
++    usdr_dev_t *d = param;
++    if (channel != 0) return -EINVAL;
++    int res = usdr_tx_gen_set(d, false, 1, 0, 0);
++    res = res ? res : usdr_cal_nco(d, false, freqoffset);
++    return res ? res : usdr_tx_gen_set(d, pwr != 0, 1, MIN(pwr,30000), 0);
+ }
+ 
+-static
+-int usdrcal_set_nco_offset(void* param, int channel, int32_t freqoffset)
++static int usdrcal_set_nco_offset(void* param, int channel, int32_t freqoffset)
+ {
+-    usdr_dev_t *d = (usdr_dev_t *)param;
+-    return _usdr_set_nco(d, true, channel, freqoffset);
++    if (channel != 0) return -EINVAL;
++    return usdr_cal_nco(param, true, freqoffset);
+ }
+ 
+ static
+@@ -1620,7 +1863,7 @@ int usdrcal_init_calibrate(usdr_dev_t *d, struct calibrate_ops* ops, unsigned ch
+     ops->rxfrequency = rxlo;
+     ops->txfrequency = txlo;
+     ops->channel = channel;
+-    ops->deflogdur = ops->rxsamplerate / 20e6;
++    ops->deflogdur = MAX(1, ops->rxsamplerate / 20000000);
+     ops->defstop = -120000;
+     ops->param = d;
+ 
+@@ -1630,8 +1873,6 @@ int usdrcal_init_calibrate(usdr_dev_t *d, struct calibrate_ops* ops, unsigned ch
+     ops->txiqimb_frac = ((uint64_t)INT_MAX + 1) / 11.1076;
+     ops->rxiqtmb_tx_off = 0;
+ 
+-    ops->coarse_mode = 0;
+-
+     ops->rxbw_factor = 2.45;
+     ops->txbw_factor = 2.45;
+ 
+@@ -1661,10 +1902,10 @@ int usdrcal_init_calibrate(usdr_dev_t *d, struct calibrate_ops* ops, unsigned ch
+     return 0;
+ }
+ 
+-int usdr_calibrate(usdr_dev_t *d, unsigned channel, unsigned param, int* sarray)
++static int usdr_run_calibrate(usdr_dev_t *d, unsigned channel, unsigned param, int* sarray)
+ {
+     int res = 0;
+-    struct calibrate_ops cops;
++    struct calibrate_ops cops = {0};
+     lldev_t dev = d->lms.dev;
+     bool externallb = ((param & USDR_CAL_EXT_FB) == USDR_CAL_EXT_FB);
+     bool norestore = false;
+@@ -1691,7 +1932,9 @@ int usdr_calibrate(usdr_dev_t *d, unsigned channel, unsigned param, int* sarray)
+     }
+ 
+     if ((param & USDR_CAL_RXLO) && (rx_lo > 0)) {
+-        USDR_LL_LOG(dev, "LMS6", USDR_LOG_INFO, "------------------ Calibration RXLO(%c) ------------------\n", 'A' + channel);
++        res = usdr_calibrate_rx_dc(d);
++        if (res) return res;
++        if (sarray) { sarray[0] = d->rx_corr.dc_i; sarray[1] = d->rx_corr.dc_q; }
+     }
+ 
+     if ((param & USDR_CAL_RXIQIMB) && (rx_lo > 0)) {
+@@ -1700,7 +1943,7 @@ int usdr_calibrate(usdr_dev_t *d, unsigned channel, unsigned param, int* sarray)
+             USDR_LL_LOG(dev, "LMS6", USDR_LOG_WARNING, "TX frontend was down, powering up\n");
+             res = res ? res : _usdr_pwr_state(d, true, true);
+             res = res ? res : usleep(500000);
+-            res = res ? res : usdr_txupdate_cal(d);
++            if (d->has_txchain) res = res ? res : usdr_txupdate_cal(d);
+         }
+         if (!externallb) {
+             res = res ? res : lms6002d_rf_loopback_en(&d->lms);
+@@ -1708,28 +1951,8 @@ int usdr_calibrate(usdr_dev_t *d, unsigned channel, unsigned param, int* sarray)
+         res = (res) ? res : calibrate_rxiqimb(&cops);
+         if (res == -ENAVAIL) {
+             USDR_LL_LOG(dev, "LMS6", USDR_LOG_WARNING, " RXIQIMB failed!\n");
+-            res = 0;
+-            cops.i = cops.q = 0;
+-        } else if (res) {
+             return res;
+-        }
+-        if (tx_lo) {
+-            res = res ? res : lms6002d_tune_pll(&d->lms, true, tx_lo);
+-            if (res == -ERANGE) {
+-                USDR_LL_LOG(dev, "LMS6", USDR_LOG_ERROR, "Unable to restore TX_LO=%.3f: out of range\n", tx_lo / 1e6);
+-                res = lms6002d_disable_pll(&d->lms, true);
+-            } else if (res == -ENOLCK) {
+-                USDR_LL_LOG(dev, "LMS6", USDR_LOG_ERROR, "Unable to restore TX_LO=%.3f: unable to lock PLL\n", tx_lo / 1e6);
+-                res = 0;
+-            }
+-        } else {
+-            res = res ? res : lms6002d_disable_pll(&d->lms, true);
+-        }
+-        if (!externallb) {
+-            res = res ? res : lms6002d_rf_loopback_dis(&d->lms);
+-        }
+-        if (res) {
+-            USDR_LL_LOG(dev, "LMS6", USDR_LOG_WARNING, " RXIQIMB failed: res=%d\n", res);
++        } else if (res) {
+             return res;
+         }
+         if (sarray) {
+@@ -1777,6 +2000,8 @@ int usdr_calibrate(usdr_dev_t *d, unsigned channel, unsigned param, int* sarray)
+                 fst_q = cops.q;
+             }
+             d->cal_txlo_dig = true;
++            cops.txlo_iq_corr.max = 2047;
++            cops.txlo_iq_corr.min = -2047;
+             res = (res) ? res : calibrate_txlo(&cops);
+             if (res) {
+                 USDR_LL_LOG(dev, "LMS6", USDR_LOG_WARNING, " TXLO failed: res=%d\n", res);
+@@ -1798,8 +2023,7 @@ int usdr_calibrate(usdr_dev_t *d, unsigned channel, unsigned param, int* sarray)
+             res = res ? res : calibrate_txiqimb(&cops);
+             if (res == -ENAVAIL) {
+                 USDR_LL_LOG(dev, "LMS6", USDR_LOG_WARNING, " TXIQIMB failed!\n");
+-                res = 0;
+-                cops.i = cops.q = 0;
++                return res;
+             }
+             res = res ? res : lms6002d_set_txvga1_gain(&d->lms, old_txvga1);
+             if (res) {
+@@ -1841,30 +2065,50 @@ int usdr_calibrate(usdr_dev_t *d, unsigned channel, unsigned param, int* sarray)
+ 
+     }
+ 
+-    if (norestore)
+-        return res;
+-
+-    res = res ? res : usdr_tx_gen_set(d, false, 0, 0, 0); // Restore TX BB
+-    res = res ? res : usdr_restore_nco(d, true);          // RXNCO
+-    res = res ? res : usdr_restore_nco(d, false);         // TXNCO
+-
+-    if (!d->rx_bw.set) {
+-        res = res ? res : _usdr_update_bandwidth(d, false);
+-    } else {
+-        res = res ? res : lms6002d_set_bandwidth(&d->lms, false, d->rx_bw.value);
+-    }
+-
+-    if (!d->tx_bw.set) {
+-        res = res ? res : _usdr_update_bandwidth(d, true);
+-    } else {
+-        res = res ? res : lms6002d_set_bandwidth(&d->lms, true, d->tx_bw.value);
+-    }
++    return res;
++}
+ 
+-    if (rx_lo == 0) {
+-        _usdr_pwr_state(d, false, false);
++int usdr_calibrate(usdr_dev_t *d, unsigned channel, unsigned param, int* sarray)
++{
++    if (channel != 0 || !d->adc_clk || !d->dac_clk) return -EINVAL;
++    if (d->tx_run || d->rx_lchans) return -EBUSY;
++    // This matched single-channel bitstream implements RX IQ and a test tone.
++    // Digital TX compensation remains a newer-chain feature.
++    if (!d->has_txchain && (param & (USDR_CAL_TXLO | USDR_CAL_TXIQIMB))) return -EOPNOTSUPP;
++    if ((param & (USDR_CAL_RXLO | USDR_CAL_RXIQIMB)) && !d->rfic_rx_lo) return -EINVAL;
++    const uint8_t regs[] = {0x05,0x07,0x08,0x09,0x0b,
++        0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1b,
++        0x20,0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x2b,
++        0x34,0x35,0x36,0x40,0x41,0x44,0x45,0x54,0x55,0x56,
++        0x64,0x65,0x68,0x70,0x71,0x72,0x75,0x76,0x7b,0x7c,0x7d};
++    uint8_t saved[SIZEOF_ARRAY(regs)];
++    for (unsigned i = 0; i < SIZEOF_ARRAY(regs); ++i) {
++        int res = usdr_lms_read(d, regs[i], &saved[i]);
++        if (res) return res;
+     }
+-    if (tx_lo == 0) {
+-        _usdr_pwr_state(d, true, false);
++    usdr_dev_t before = *d;
++    int result[8] = {0};
++    int res = usdr_run_calibrate(d, channel, param, result);
++    struct imb_data rx = d->rx_corr, tx = d->tx_corr;
++    usdr_cleanup_error(&res, usdr_tx_gen_set(d, false, 0, 0, 0));
++    usdr_cleanup_error(&res, usdr_cal_nco(d, true, 0));
++    usdr_cleanup_error(&res, usdr_cal_nco(d, false, 0));
++    for (unsigned i = 0; i < SIZEOF_ARRAY(regs); ++i)
++        usdr_cleanup_error(&res, usdr_lms_write(d, regs[i], saved[i]));
++    *d = before;
++    if (!res) {
++        d->rx_corr = rx; d->tx_corr = tx;
++        if (param & USDR_CAL_RXLO)
++            res = lms6002d_set_rxfedc(&d->lms, rx.dc_i, rx.dc_q);
+     }
++    usdr_cleanup_error(&res, usdr_rxupdate_cal(d));
++    if (d->has_txchain) usdr_cleanup_error(&res, usdr_txupdate_cal(d));
++    if (res) {
++        d->rx_corr = before.rx_corr; d->tx_corr = before.tx_corr;
++        for (unsigned i = 0; i < SIZEOF_ARRAY(regs); ++i)
++            if (regs[i] == 0x71 || regs[i] == 0x72)
++                usdr_cleanup_error(&res, usdr_lms_write(d, regs[i], saved[i]));
++        usdr_cleanup_error(&res, usdr_rxupdate_cal(d));
++    } else if (sarray) memcpy(sarray, result, sizeof(result));
+     return res;
+ }
+diff --git a/src/lib/device/m2_lm6_1/usdr_ctrl.h b/src/lib/device/m2_lm6_1/usdr_ctrl.h
+index 0686943..db16ada 100644
+--- a/src/lib/device/m2_lm6_1/usdr_ctrl.h
++++ b/src/lib/device/m2_lm6_1/usdr_ctrl.h
+@@ -206,6 +206,7 @@ int usdr_rfic_bb_set_badwidth(struct usdr_dev *d,
+                               unsigned bw,
+                               unsigned* actualbw);
+ 
++int usdr_rfic_get_rx_gain(struct usdr_dev *d, int *gain);
+ int usdr_rfic_set_gain(struct usdr_dev *d,
+                        unsigned gain_type,
+                        int gain,
+diff --git a/src/lib/hw/lms6002d/lms6002d.c b/src/lib/hw/lms6002d/lms6002d.c
+index fc94be1..1d356d8 100644
+--- a/src/lib/hw/lms6002d/lms6002d.c
++++ b/src/lib/hw/lms6002d/lms6002d.c
+@@ -39,12 +39,60 @@ int lms6002d_spi_post(lms6002d_state_t* obj, uint16_t* regs, unsigned count)
+         if (res)
+             return res;
+ 
++        switch ((regs[i] >> 8) & 0x7f) {
++        case TOP_ENCFG: obj->top_encfg = (uint8_t)regs[i]; break;
++        case TOP_ENREG: obj->top_enreg = (uint8_t)regs[i]; break;
++        case RFE_IN1SEL_DCI: obj->rfe_in1sel_dci = (uint8_t)regs[i]; break;
++        }
++
+         USDR_LOG("6002", USDR_LOG_NOTE, "[%d/%d] reg wr %04x\n", i, count, regs[i]);
+     }
+ 
+     return 0;
+ }
+ 
++static int lms6002d_spi_rd(lms6002d_state_t* obj, uint8_t addr, uint8_t* data);
++
++static int lms6002d_wr(lms6002d_state_t* obj, uint8_t addr, uint8_t value)
++{
++    uint16_t word = MAKE_LMS6002D_REG_WR(addr, value);
++    return lms6002d_spi_post(obj, &word, 1);
++}
++
++static int lms6002d_update(lms6002d_state_t* obj, uint8_t addr, uint8_t mask, uint8_t value)
++{
++    uint8_t old;
++    int res = lms6002d_spi_rd(obj, addr, &old);
++    return res ? res : lms6002d_wr(obj, addr, (old & ~mask) | (value & mask));
++}
++
++struct lms6002d_saved_reg { uint8_t addr, value; };
++
++static int lms6002d_save(lms6002d_state_t* obj, struct lms6002d_saved_reg* regs, unsigned count)
++{
++    for (unsigned i = 0; i < count; ++i) {
++        int res = lms6002d_spi_rd(obj, regs[i].addr, &regs[i].value);
++        if (res)
++            return res;
++    }
++    return 0;
++}
++
++// Attempt every restoration even after a bus error; keep the original failure.
++static int lms6002d_restore(lms6002d_state_t* obj, const struct lms6002d_saved_reg* regs,
++                          unsigned count, int res)
++{
++    for (unsigned i = 0; i < count; ++i) {
++        int cleanup = lms6002d_wr(obj, regs[i].addr, regs[i].value);
++        if (cleanup) {
++            USDR_LOG("6002", USDR_LOG_ERROR, "Failed to restore register %02x: %d\n", regs[i].addr, cleanup);
++            if (!res)
++                res = cleanup;
++        }
++    }
++    return res;
++}
++
+ static
+ int lms6002d_spi_rd(lms6002d_state_t* obj, uint8_t addr, uint8_t* data)
+ {
+@@ -76,6 +124,8 @@ int lms6002d_create(lldev_t dev, unsigned subdev, unsigned lsaddr, struct lms600
+     out->rfe_gain_lna_sel = 0xc0;
+     out->trf_pa_ctrl = (uint8_t)MAKE_LMS6002D_TRF_PA_CTRL(0, 0);
+     out->trf_vga1_gain = (uint8_t)GET_LMS6002D_TRF_VGA1GAIN_VGA1GAIN(21);
++    out->rfe_in1sel_dci = 0x80;
++    out->rx_bandwidth = out->tx_bandwidth = 0;
+ 
+     memset(out->rclpfcal, 3, sizeof(out->rclpfcal));
+ 
+@@ -273,9 +323,14 @@ int lms6002d_tune_pll_stat(lms6002d_state_t* obj, bool tx, unsigned freq, bool m
+ {
+     int res;
+     unsigned k;
+-    if (freq < 170000000)
++    if (!obj->fref || freq < 170000000 || freq > 3800000000u)
+         return -ERANGE;
+ 
++    if (!mkstat && (!pstat || pstat->vco_cap_min > pstat->vco_cap_max ||
++                    pstat->vco_cap_max > 63 || pstat->vco_div > 3 ||
++                    pstat->vco_num < 4 || pstat->vco_num > 7))
++        return -EINVAL;
++
+     for (k = 0; k < SIZEOF_ARRAY(s_vco_ranges) - 1; k++) {
+         if (freq <= s_vco_ranges[k].freqmax)
+             break;
+@@ -288,6 +343,9 @@ int lms6002d_tune_pll_stat(lms6002d_state_t* obj, bool tx, unsigned freq, bool m
+     uint64_t vcofreq = (uint64_t)freq << (vco_div + 1);
+     struct nint_nfrac nn = lms6002d_pll_calc(obj->fref, vcofreq);
+ 
++    if (nn.nint > 511)
++        return -ERANGE;
++
+     USDR_LOG("6002", USDR_LOG_INFO, "pll %s: OUT=%u VCO_FREQ=%llu VCO_NUM=%d VCO_DIV=%d NINT=%u NFRAC=%u FREF=%u VCO_CAP=%d\n",
+              tx ? "tx" : "rx", freq, (unsigned long long)vcofreq, 8 - vco_num, vco_div + 1, nn.nint, nn.frac, obj->fref, vco_cap);
+ 
+@@ -330,7 +388,7 @@ int lms6002d_tune_pll_stat(lms6002d_state_t* obj, bool tx, unsigned freq, bool m
+     };
+     res = lms6002d_spi_post(obj, regs, SIZEOF_ARRAY(regs));
+     if (res)
+-        return res;
++        goto finish;
+ 
+     // Toggle Changes for shadow register (2 cycles+ on SEN high)
+     //   lowlevel_reg_wr32(obj->dev, obj->subdev, 0, (1<<29) | 1);
+@@ -338,144 +396,88 @@ int lms6002d_tune_pll_stat(lms6002d_state_t* obj, bool tx, unsigned freq, bool m
+ 
+     usleep(100);
+ 
+-    uint8_t wrreg[4] = {0};
+-    lms6002d_spi_rd(obj, tx ? TXPLL_NINT_NFRAC_BY0 : RXPLL_NINT_NFRAC_BY0, &wrreg[0]);
+-    lms6002d_spi_rd(obj, tx ? TXPLL_NINT_NFRAC_BY1 : RXPLL_NINT_NFRAC_BY1, &wrreg[1]);
+-    lms6002d_spi_rd(obj, tx ? TXPLL_NINT_NFRAC_BY2 : RXPLL_NINT_NFRAC_BY2, &wrreg[2]);
+-    lms6002d_spi_rd(obj, tx ? TXPLL_NINT_NFRAC_BY3 : RXPLL_NINT_NFRAC_BY3, &wrreg[3]);
+-
+-    if (((regs[1] & 0xff) != wrreg[0]) ||
+-        ((regs[2] & 0xff) != wrreg[1]) ||
+-        ((regs[3] & 0xff) != wrreg[2]) ||
+-        ((regs[4] & 0xff) != wrreg[3])) {
+-
+-        USDR_LOG("6002", USDR_LOG_ERROR, "Sanity check error! device malfunction!\n");
+-        return -EIO;
++    for (unsigned n = 0; n < 4; ++n) {
++        uint8_t value;
++        res = lms6002d_spi_rd(obj, (tx ? 0x10 : 0x20) + n, &value);
++        if (!res && value != (uint8_t)regs[n + 1])
++            res = -EIO;
++        if (res)
++            goto finish;
+     }
+ 
+-    uint8_t lo, hi;
+-    res = lms6002d_find_vcocap(obj, tx, &hi, &lo);
++    uint8_t lo = vco_cap, hi = vco_cap;
++    // Cached tuning already installed the midpoint. Re-running the search here
++    // used to leave the PLL on the last probe code and bypass its error check.
++    if (mkstat)
++        res = lms6002d_find_vcocap(obj, tx, &hi, &lo);
++    if (!res && lo > hi)
++        res = -ENOLCK;
+     if (res)
+-        return res;
+-
+-    // We set cahed values, no need to do VCO calibration
+-    if (!mkstat)
+-        return res;
+-
+-    // TODO add thermal info
+-    vco_cap = (lo + hi) / 2;
+-    uint16_t vregs[] = {
+-        tx ? MAKE_LMS6002D_TXPLL_PLL_CFG2(0, vco_cap) :
+-             MAKE_LMS6002D_RXPLL_PLL_CFG2(0, vco_cap),
+-        tx ? MAKE_LMS6002D_TXPLL_VCO_DIV(vco_num, vco_div | 4, 0) :
+-             MAKE_LMS6002D_RXPLL_VCO_DIV_BUFSEL(vco_num, vco_div | 4,
+-                                                GET_LMS6002D_RXPLL_VCO_DIV_BUFSEL_SELOUT(obj->rxpll_vco_div_bufsel)),
+-        tx ? 0x9b7e : 0xab7e, //PD comparator
+- //       tx ? MAKE_LMS6002D_LMS6002D_TXPLL_0x17(1, 1, 0, 2) :
+- //            MAKE_LMS6002D_LMS6002D_RXPLL_0x27(1, 1, 0, 2),
+-    };
+-    res = lms6002d_spi_post(obj, vregs, SIZEOF_ARRAY(vregs));
++        goto finish;
++    vco_cap = ((unsigned)lo + hi) / 2;
++    res = lms6002d_wr(obj, tx ? TXPLL_PLL_CFG2 : RXPLL_PLL_CFG2, vco_cap);
+     if (res)
+-        return res;
+-
+-    USDR_LOG("6002", USDR_LOG_INFO, "pll %s: vco_cap[%d;%d] => %d /%d / %02x -> %02x\n",
+-             tx ? "tx" : "rx", lo, hi, vco_cap, vco_num, obj->rxpll_vco_div_bufsel, vregs[1] );
+-
+-    if (!tx)
+-        obj->rxpll_vco_div_bufsel = vregs[1];
+-
+-    // TODO add more options for failed locks
+-    if (lo > hi && hi == 0) {
+-        return -ENOLCK;
+-    }
+-    if (pstat) {
++        goto finish;
++    usleep(150);
++    res = lms6002d_get_comp(obj, tx);
++    if (res > 0)
++        res = -ENOLCK;
++    if (!res && mkstat && pstat) {
+         pstat->vco_cap_min = lo;
+         pstat->vco_cap_max = hi;
+         pstat->vco_num = vco_num;
+         pstat->vco_div = vco_div;
+     }
+-    return 0;
++    if (!res && !tx)
++        obj->rxpll_vco_div_bufsel = (uint8_t)regs[7];
++finish:
++    {
++        int cleanup = lms6002d_update(obj, tx ? 0x1b : 0x2b, 8, 8);
++        if (!res && !cleanup) {
++            uint64_t num = ((uint64_t)nn.nint * (1u << 23) + nn.frac) * obj->fref;
++            uint64_t den = 1ull << (24 + vco_div);
++            if (tx) obj->tx_frequency = (num + den / 2) / den;
++            else obj->rx_frequency = (num + den / 2) / den;
++        }
++        return res ? res : cleanup;
++    }
+ }
+ 
+-// TODO proper calibration
+-static struct lpf_band_lut {
+-    uint16_t freq_khz;
+-    uint8_t band;
+-    uint8_t rc;
+-} s_lpf_lut[] = {
+-    { 1030, 15, 7 },
+-    { 1190, 15, 6 },
+-    { 1333, 15, 5 },
+-    { 1500, 15, 4 },
+-    { 1650, 15, 3 },
+-    { 1700, 14, 4 },
+-    { 1870, 14, 3 },
+-    { 2250, 13, 5 }, //2210
+-    { 2750, 13, 4 }, //2500
+-    { 3000, 12, 4 }, //2750
+-    { 3250, 11, 4 }, //3000
+-    { 3650, 11, 3 }, //3300
+-    { 4170, 10, 4 }, //3840
+-    { 4650, 10, 3 }, //4220
+-    { 5200, 10, 2 }, //4740
+-    { 5500,  9, 4 }, //5000
+-    { 5750,  7, 5 }, //5310
+-    { 6000,  8, 4 }, //5500
+-    { 6500,  7, 4 }, //6000
+-    { 7250,  7, 3 }, //6590
+-    { 7550,  6, 4 }, //7000
+-    { 8400,  6, 3 }, //7690
+-    { 9400,  5, 4 }, //8750
+-    { 10400, 5, 3 }, //9620
+-    { 11650, 4, 4 }, //10000
+-    { 12400, 4, 3 }, //11000
+-    { 14400, 3, 4 }, //12000
+-    { 15200, 3, 3 }, //13200
+-    { 16650, 2, 4 }, //14000
+-    { 18900, 2, 3 }, //15400
+-    { 21150, 1, 5 }, //17700
+-    { 24000, 1, 4 }, //20000
+-    { 25650, 1, 3 }, //22000
+-    { 28650, 0, 5 }, //24800
+-    { 31900, 0, 4 }, //28000
+-    { 35400, 0, 3 }, //30800
+-    { 39150, 0, 2 }, //34600
+-    { 44650, 0, 1 }, //41200
+-    { 47000, 0, 0 },
++// Full complex RF bandwidths from the LMS6002D programming guide (BWC 15..0).
++static const unsigned s_lpf_bandwidths[LPF_BANDS] = {
++    28000000, 20000000, 14000000, 12000000, 10000000, 8750000, 7000000, 6000000,
++    5500000, 5000000, 3840000, 3000000, 2750000, 2500000, 1750000, 1500000,
+ };
+ 
+ int lms6002d_set_bandwidth(lms6002d_state_t* obj, bool tx, unsigned freq)
+ {
+-    int res;
++    if (!freq)
++        return -EINVAL;
++    bool bypass = freq > s_lpf_bandwidths[0];
+     unsigned band = 0;
+-    unsigned b = 1;
+-    unsigned lpfcal = 0;
+-
+-    for (unsigned i = 0; i < SIZEOF_ARRAY(s_lpf_lut); i++) {
+-        if ((freq / 1000) <= s_lpf_lut[i].freq_khz) {
+-            band = s_lpf_lut[i].band;
+-            lpfcal = s_lpf_lut[i].rc;
+-            b = 0;
+-            break;
++    if (!bypass) {
++        for (band = LPF_BANDS - 1; band > 0; --band)
++            if (s_lpf_bandwidths[band] >= freq)
++                break;
++        if (!(obj->rclpfcal[band] & 0x80)) {
++            int res = lms6002d_cal_lpf_bandwidth(obj, band, true);
++            if (res)
++                return res;
+         }
+     }
+-
+-    // 0x30 -- TX LPF
+-    // 0x50 -- RX LPF
+-    uint16_t regs[] = {
+-        (tx ? 0x3400 : 0x5400) | 0x8000 | (band << 2) | (b ? 0x000 : 0x0002),
+-        (tx ? 0x3500 : 0x5500) | 0x8000 | (b << 6) | 0x000C,
+-        (tx ? 0x3600 : 0x5600) | 0x8000 | (lpfcal << 4),
+-    };
+-
+-    USDR_LOG("6002", USDR_LOG_INFO, "LPF_%s %d => BAND=%d RC=%d BYPASS=%d CAL=%d\n",
+-             tx ? "TX" : "RX", freq / 1000, band, lpfcal, b, obj->rclpfcal[band]);
+-
+-    res = lms6002d_spi_post(obj, regs, SIZEOF_ARRAY(regs));
+-    if (res)
+-        return res;
++    uint8_t base = tx ? 0x30 : 0x50;
++    // Do not overwrite DCO_DACCAL, DECODE, or the power-down controls.
++    int res = lms6002d_update(obj, base + 4, 0x3e, (band << 2) | (bypass ? 0 : 2));
++    res = res ? res : lms6002d_update(obj, base + 5, 0x40, bypass ? 0x40 : 0);
++    if (!bypass)
++        res = res ? res : lms6002d_update(obj, base + 6, 0x70, (obj->rclpfcal[band] & 7) << 4);
++    if (!res) {
++        if (tx)
++            obj->tx_bandwidth = bypass ? 0 : s_lpf_bandwidths[band];
++        else
++            obj->rx_bandwidth = bypass ? 0 : s_lpf_bandwidths[band];
++    }
+     return res;
+-
+ }
+ 
+ int lms6002d_set_rxlna_gain(lms6002d_state_t* obj, unsigned lnag)
+@@ -564,14 +566,8 @@ int lms6002d_set_rxvga2ab_gain(lms6002d_state_t* obj, unsigned vga2a, unsigned v
+ 
+ int lms6002d_set_rx_extterm(lms6002d_state_t* obj, bool extterm)
+ {
+-    uint16_t regs[] = {
+-        0x8000 | 0x7100 | (obj->rfe_in1sel_dci & 0x7f) | (extterm ? 0 : 0x80),
+-        0x8000 | 0x7c00 | (extterm ? 4 : 0), // RINEN_MIX_RXFE
+-    };
+-
+-    //obj->rxfe_0x71 = regs[0];
+-
+-    return lms6002d_spi_post(obj, regs, SIZEOF_ARRAY(regs));
++    int res = lms6002d_update(obj, RFE_IN1SEL_DCI, 0x80, extterm ? 0 : 0x80);
++    return res ? res : lms6002d_update(obj, RFE_LOMIX_GLNA3, 4, extterm ? 4 : 0);
+ }
+ 
+ int lms6002d_set_rx_path(lms6002d_state_t* obj, unsigned path)
+@@ -604,60 +600,47 @@ int lms6002d_set_tx_path(lms6002d_state_t* obj, unsigned path)
+ static
+ int lms6002d_calibration_loop(lms6002d_state_t* obj, uint16_t reg, uint8_t addr, uint8_t *pureg)
+ {
+-    uint8_t ureg, ulck;
+-    int res;
+-    bool fail = true;
+-    // Do calibration
+-    uint16_t regs_c0[] = {
+-        (reg << 8) | MAKE_LMS6002D_TOP_DC_REG(31),
+-        (reg << 8) | MAKE_LMS6002D_TOP_DC_OP(0, 0, 1, addr),
+-        (reg << 8) | MAKE_LMS6002D_TOP_DC_OP(1, 0, 1, addr),
+-        (reg << 8) | MAKE_LMS6002D_TOP_DC_OP(0, 0, 1, addr),
+-    };
+-
+-    res = lms6002d_spi_post(obj, regs_c0, SIZEOF_ARRAY(regs_c0));
+-    if (res)
+-        return res;
+-
+-    for (unsigned t = 0; t < 100; t++) {
+-        usleep(7);
+-
+-        // read clbr_done
+-        res = lms6002d_spi_rd(obj, (reg) | TOP_DC_CAL, &ulck);
+-        if (res)
+-            return res;
+-
+-        // read dc_lock
+-        if (GET_LMS6002D_TOP_DC_CAL_CLBR_DONE(ulck))
+-            continue;
+-
+-        res = lms6002d_spi_rd(obj, (reg) | TOP_DC_REG, &ureg);
++    if (!obj->fref || !pureg)
++        return -EINVAL;
++    // FAQ 4.5: 64 cycles at Fref/16 for VGA2, Fref/256 for the LPFs.
++    unsigned divider = reg == 0x60 ? 16 : 256;
++    unsigned wait_us = (64000000ull * divider + obj->fref - 1) / obj->fref;
++    for (unsigned attempt = 0; attempt < 2; ++attempt) {
++        uint16_t seq[] = {
++            (reg << 8) | MAKE_LMS6002D_TOP_DC_OP(0, 0, 1, addr),
++            (reg << 8) | MAKE_LMS6002D_TOP_DC_CNTVAL(attempt ? 0 : 31),
++            (reg << 8) | MAKE_LMS6002D_TOP_DC_OP(0, 1, 1, addr),
++            (reg << 8) | MAKE_LMS6002D_TOP_DC_OP(0, 0, 1, addr),
++            (reg << 8) | MAKE_LMS6002D_TOP_DC_OP(1, 0, 1, addr),
++            (reg << 8) | MAKE_LMS6002D_TOP_DC_OP(0, 0, 1, addr),
++        };
++        int res = lms6002d_spi_post(obj, seq, SIZEOF_ARRAY(seq));
+         if (res)
+             return res;
+-        ureg &= 0x1f;
+-
+-        if (ureg == 0x1f) {
+-            uint16_t p[] = { (reg << 8) | MAKE_LMS6002D_TOP_DC_REG(0),
+-                             (reg << 8) | MAKE_LMS6002D_TOP_DC_OP(0, 0, 1, addr),
+-                             (reg << 8) | MAKE_LMS6002D_TOP_DC_OP(1, 0, 1, addr),
+-                             (reg << 8) | MAKE_LMS6002D_TOP_DC_OP(0, 0, 1, addr),
+-                           };
+-
+-            res = lms6002d_spi_post(obj, p, SIZEOF_ARRAY(p));
++        uint8_t status;
++        unsigned poll;
++        for (poll = 0; poll < 10; ++poll) {
++            usleep(wait_us + 1);
++            res = lms6002d_spi_rd(obj, reg + 1, &status);
+             if (res)
+                 return res;
+-
+-            continue;
++            if (!GET_LMS6002D_TOP_DC_CAL_CLBR_DONE(status))
++                break;
++        }
++        if (poll == 10)
++            return -ETIMEDOUT;
++        uint8_t value;
++        res = lms6002d_spi_rd(obj, reg, &value);
++        if (res)
++            return res;
++        value &= 0x3f;
++        // FAQ 4.7: 31 may be a valid zero correction. Reseed once to distinguish it.
++        if ((!attempt && value != 31) || (attempt && value != 0)) {
++            *pureg = value;
++            return 0;
+         }
+-
+-        fail = false;
+-        break;
+     }
+-    USDR_LOG("6002", USDR_LOG_INFO, "calibration[%x:%d] done: %d; %d\n",
+-             reg, addr, fail, ureg);
+-
+-    *pureg = ureg;
+-    return fail ? -EFAULT : 0;
++    return -EIO;
+ }
+ 
+ 
+@@ -687,202 +670,114 @@ int lms6002d_rfe_enable(lms6002d_state_t* obj, bool en)
+ 
+ int lms6002d_rxvga2_enable(lms6002d_state_t* obj, bool en)
+ {
+-    uint16_t regs[] = {
+-        MAKE_LMS6002D_RXVGA2_CTRL(7, en ? 1 : 0, 1),
+-    };
+-    return lms6002d_spi_post(obj, regs, SIZEOF_ARRAY(regs));
++    // Keep the FAQ-recommended ADC common mode; split gain control uses direct mode.
++    return lms6002d_update(obj, RXVGA2_CTRL, 3, en ? 3 : 1);
+ }
+ 
+ int lms6002d_cal_lpf(lms6002d_state_t* obj)
+ {
+-    int res;
+-    uint8_t ureg;
+-
+-    SET_LMS6002D_TOP_ENREG_CLK_LPF_CAL(obj->top_enreg, 1);
+-
+-    uint16_t regs_0[] = {
+-        MAKE_LMS6002D_AFE_MISC(0, 1, 1, 1, 1, 1),
+-        MAKE_LMS6002D_REG_WR(TOP_ENREG, obj->top_enreg),
+-    };
+-    res = lms6002d_spi_post(obj, regs_0, SIZEOF_ARRAY(regs_0));
+-    if (res)
+-        return res;
+-
+-    res = lms6002d_calibration_loop(obj, 0, 0, &ureg);
+-    if (res == 0) {
+-        uint16_t regs_c1[] = {
+-            MAKE_LMS6002D_RXLPF_DACBP(0, ureg),
+-            MAKE_LMS6002D_TXLPF_DACBP(0, ureg),
+-        };
+-        res = lms6002d_spi_post(obj, regs_c1, SIZEOF_ARRAY(regs_c1));
+-        if (res)
+-            return res;
+-
+-    }
+-
+-    SET_LMS6002D_TOP_ENREG_CLK_LPF_CAL(obj->top_enreg, 0);
+-
+-    regs_0[0] = MAKE_LMS6002D_AFE_MISC(1, 1, 1, 1, 1, 1); //Power down DC offset comparators
+-    regs_0[1] = MAKE_LMS6002D_REG_WR(TOP_ENREG, obj->top_enreg);
+-    res = lms6002d_spi_post(obj, regs_0, SIZEOF_ARRAY(regs_0));
++    struct lms6002d_saved_reg saved[] = {{TOP_ENREG, 0}, {TOP_POWER, 0}};
++    int res = lms6002d_save(obj, saved, SIZEOF_ARRAY(saved));
+     if (res)
+         return res;
+-
+-    return 0;
++    uint8_t value;
++    res = lms6002d_wr(obj, TOP_ENREG, saved[0].value | (1 << 5));
++    res = res ? res : lms6002d_wr(obj, TOP_POWER, saved[1].value & ~2);
++    res = res ? res : lms6002d_calibration_loop(obj, 0, 0, &value);
++    res = res ? res : lms6002d_update(obj, RXLPF_DACBP, 0x3f, value);
++    res = res ? res : lms6002d_update(obj, TXLPF_DACBP, 0x3f, value);
++    return lms6002d_restore(obj, saved, SIZEOF_ARRAY(saved), res);
+ }
+ 
+-
+ int lms6002d_cal_txrxlpfdc(lms6002d_state_t* obj, bool tx)
+ {
+-    int res;
+-    uint16_t breg = tx ? 0x30 : 0x50;
+-    uint8_t ureg_i, ureg_q;
+-
+-    SET_LMS6002D_TOP_ENREG_CLK_RX_RPL_DCCAL(obj->top_enreg, !tx);
+-    SET_LMS6002D_TOP_ENREG_CLK_TX_RPL_DCCAL(obj->top_enreg, tx);
+-
+-    uint16_t regs_0[] = {
+-        MAKE_LMS6002D_REG_WR(TOP_ENREG, obj->top_enreg),
+-    };
+-
+-    res = lms6002d_spi_post(obj, regs_0, SIZEOF_ARRAY(regs_0));
++    uint8_t base = tx ? 0x30 : 0x50;
++    struct lms6002d_saved_reg saved[] = {{TOP_ENREG, 0}, {base + 15, 0}};
++    int res = lms6002d_save(obj, saved, SIZEOF_ARRAY(saved));
+     if (res)
+         return res;
+-
+-    res = lms6002d_calibration_loop(obj, breg, 0, &ureg_i);
+-    if (res)
+-        goto fail_i;
+-
+-    res = lms6002d_calibration_loop(obj, breg, 1, &ureg_q);
+-    if (res)
+-        goto fail_q;
+-
+-fail_i:
+-fail_q:
+-    SET_LMS6002D_TOP_ENREG_CLK_LPF_CAL(obj->top_enreg, 0);
+-    SET_LMS6002D_TOP_ENREG_CLK_RX_RPL_DCCAL(obj->top_enreg, 0);
+-    SET_LMS6002D_TOP_ENREG_CLK_TX_RPL_DCCAL(obj->top_enreg, 0);
+-
+-    regs_0[0] = MAKE_LMS6002D_REG_WR(TOP_ENREG, obj->top_enreg);
+-    res = lms6002d_spi_post(obj, regs_0, SIZEOF_ARRAY(regs_0));
+-    if (res)
+-        return res;
+-
+-    return 0;
++    uint8_t value;
++    res = lms6002d_wr(obj, TOP_ENREG, saved[0].value | (tx ? 2 : 8));
++    res = res ? res : lms6002d_wr(obj, base + 15, saved[1].value & ~0x80);
++    res = res ? res : lms6002d_calibration_loop(obj, base, 0, &value);
++    res = res ? res : lms6002d_calibration_loop(obj, base, 1, &value);
++    // FAQ 5.26: disable comparators after calibration, including failed attempts.
++    saved[1].value |= 0x80;
++    return lms6002d_restore(obj, saved, SIZEOF_ARRAY(saved), res);
+ }
+ 
+ int lms6002d_cal_vga2(lms6002d_state_t* obj)
+ {
+-    int res;
+-    uint8_t ureg_dcref = ~0, ureg_2ai = ~0, ureg_2aq = ~0, ureg_2bi = ~0, ureg_2bq = ~0;
+-
+-    SET_LMS6002D_TOP_ENREG_CLK_RX_VGA2_DCCAL(obj->top_enreg, 1);
+-
+-    uint16_t regs_0[] = {
+-        MAKE_LMS6002D_RXVGA2_PD_CALIB(0, 0),
+-        MAKE_LMS6002D_REG_WR(TOP_ENREG, obj->top_enreg),
+-        // MAKE_LMS6002D_RXVGA2_CTRL(7, 1, 1),
+-        MAKE_LMS6002D_RXVGA2_GAIN(0, 10),
++    struct lms6002d_saved_reg saved[] = {
++        {RXVGA2_GAIN, 0}, {RXVGA2_GAIN_COMB, 0}, {RXVGA2_CTRL, 0},
++        {RXVGA2_PD_CALIB, 0}, {TOP_ENREG, 0},
+     };
+-
+-    uint16_t regs_1[] = {
+-        MAKE_LMS6002D_RXVGA2_GAIN(10, 0),
+-    };
+-
+-    res = lms6002d_spi_post(obj, regs_0, SIZEOF_ARRAY(regs_0));
+-    if (res)
+-        goto fail_cal;
+-
+-    res = lms6002d_calibration_loop(obj, 0x60, 0, &ureg_dcref);
+-    if (res)
+-        goto fail_cal;
+-
+-    res = lms6002d_calibration_loop(obj, 0x60, 1, &ureg_2ai);
+-    if (res)
+-        goto fail_cal;
+-
+-    res = lms6002d_calibration_loop(obj, 0x60, 2, &ureg_2aq);
+-    if (res)
+-        goto fail_cal;
+-
+-    res = lms6002d_spi_post(obj, regs_1, SIZEOF_ARRAY(regs_1));
+-    if (res)
+-        goto fail_cal;
+-
+-    res = lms6002d_calibration_loop(obj, 0x60, 3, &ureg_2bi);
+-    if (res)
+-        goto fail_cal;
+-
+-    res = lms6002d_calibration_loop(obj, 0x60, 4, &ureg_2bq);
+-    if (res)
+-        goto fail_cal;
+-
+-fail_cal:
+-    SET_LMS6002D_TOP_ENREG_CLK_RX_VGA2_DCCAL(obj->top_enreg, 0);
+-    regs_0[0] = MAKE_LMS6002D_RXVGA2_PD_CALIB(1, 1); // Turn off VGA2 comparators
+-    regs_0[1] = MAKE_LMS6002D_REG_WR(TOP_ENREG, obj->top_enreg);
+-    res = lms6002d_spi_post(obj, regs_0, SIZEOF_ARRAY(regs_0));
++    int res = lms6002d_save(obj, saved, SIZEOF_ARRAY(saved));
+     if (res)
+         return res;
+-
+-    USDR_LOG("6002", USDR_LOG_INFO, "VGA2 calibration done [%d, %d, %d, %d, %d]\n",
+-             ureg_dcref, ureg_2ai, ureg_2aq, ureg_2bi, ureg_2bq);
+-    return 0;
++    uint8_t value;
++    res = lms6002d_wr(obj, TOP_ENREG, saved[4].value | (1 << 4));
++    res = res ? res : lms6002d_wr(obj, RXVGA2_PD_CALIB, saved[3].value & ~0xc0);
++    // Improved RXVGA2 calibration note: reference at combined 30 dB in decode mode.
++    res = res ? res : lms6002d_wr(obj, RXVGA2_CTRL, saved[2].value & ~1);
++    res = res ? res : lms6002d_wr(obj, RXVGA2_GAIN_COMB, 10);
++    res = res ? res : lms6002d_calibration_loop(obj, 0x60, 0, &value);
++    // Isolate each stage at 18 dB, without altering common mode.
++    res = res ? res : lms6002d_wr(obj, RXVGA2_CTRL, saved[2].value | 1);
++    res = res ? res : lms6002d_wr(obj, RXVGA2_GAIN, 0x06);
++    res = res ? res : lms6002d_calibration_loop(obj, 0x60, 1, &value);
++    res = res ? res : lms6002d_calibration_loop(obj, 0x60, 2, &value);
++    res = res ? res : lms6002d_wr(obj, RXVGA2_GAIN, 0x60);
++    res = res ? res : lms6002d_calibration_loop(obj, 0x60, 3, &value);
++    res = res ? res : lms6002d_calibration_loop(obj, 0x60, 4, &value);
++    saved[3].value |= 0xc0;
++    return lms6002d_restore(obj, saved, SIZEOF_ARRAY(saved), res);
+ }
+ 
+ int lms6002d_cal_lpf_bandwidth(lms6002d_state_t* obj, unsigned bcode, bool do_tune)
+ {
+-    // TURN ON tx, SET tx to 320Mhz
+-    int res = 0;
+-    uint8_t rcal = ~0;
+-    if (bcode >= LPF_BANDS)
++    if (bcode >= LPF_BANDS || !obj->fref)
+         return -EINVAL;
+-
+-    bool txen = GET_LMS6002D_TOP_ENCFG_STXEN(obj->top_encfg);
+-
+-    res = res ? res : lms6002d_trf_enable(obj, 1);
+-    res = (!do_tune || res) ? res : lms6002d_tune_pll(obj, true, 320000000);
+-
+-    uint16_t regs_0[] = {
+-        MAKE_LMS6002D_TOP_LPF_CTRL(0, 0, 0, 0),
+-        MAKE_LMS6002D_TOP_LPF_CAL(0, 0, bcode),
+-        MAKE_LMS6002D_TOP_LPF_CAL(1, 0, bcode),
+-        MAKE_LMS6002D_TOP_LPF_CTRL(0, 0, 0, 1),
+-        MAKE_LMS6002D_TOP_LPF_CTRL(0, 0, 0, 0),
++    // Each call restores the caller's PLL. Do not rely on a previous calibration
++    // leaving TX at 320 MHz, even when an older caller passes do_tune=false.
++    (void)do_tune;
++    struct lms6002d_saved_reg saved[] = {
++        {TOP_LPF_CAL, 0}, {TOP_LPF_CTRL, 0},
++        {0x10, 0}, {0x11, 0}, {0x12, 0}, {0x13, 0}, {0x14, 0},
++        {0x15, 0}, {0x16, 0}, {0x17, 0}, {0x18, 0}, {0x19, 0}, {0x1b, 0},
++        {TOP_ENCFG, 0}, {TOP_ENREG, 0},
+     };
+-    res = res ? res : lms6002d_spi_post(obj, regs_0, SIZEOF_ARRAY(regs_0));
+-
++    uint64_t saved_tx_frequency = obj->tx_frequency;
++    int res = lms6002d_save(obj, saved, SIZEOF_ARRAY(saved));
++    if (res)
++        return res;
++    obj->rclpfcal[bcode] = 0;
++    if (obj->fref != 40000000)
++        res = lms6002d_tune_pll(obj, true, 320000000);
++    uint8_t ctrl = obj->fref == 40000000 ? 0x0c : 0;
++    res = res ? res : lms6002d_wr(obj, TOP_LPF_CTRL, ctrl);
++    res = res ? res : lms6002d_wr(obj, TOP_LPF_CAL, 0x80 | bcode);
++    res = res ? res : lms6002d_wr(obj, TOP_LPF_CTRL, ctrl | 1);
++    usleep(1); // Reset pulse must exceed 100 ns, including fast SPI implementations.
++    res = res ? res : lms6002d_wr(obj, TOP_LPF_CTRL, ctrl);
+     usleep(10);
+-
+-    // read clbr_done
++    uint8_t rcal = 0;
+     res = res ? res : lms6002d_spi_rd(obj, TOP_DC_CAL, &rcal);
+-
+-    USDR_LOG("6002", USDR_LOG_INFO, "LPFBW code=%d cal=%02x val=%d\n",
+-             bcode, rcal, GET_LMS6002D_TOP_DC_CAL_RC_LPF(rcal));
+-
+-    // Update calibration code
+-    obj->rclpfcal[bcode] = GET_LMS6002D_TOP_DC_CAL_RC_LPF(rcal) | 0x80;
+-
+-    // Store calibration value
+-    if (!txen) {
+-        SET_LMS6002D_TOP_ENCFG_STXEN(obj->top_encfg, 0);
+-    }
+-    uint16_t regs_1[] = {
+-        MAKE_LMS6002D_TOP_LPF_CTRL(0, 1, 0, 0),
+-        MAKE_LMS6002D_TOP_LPF_CAL(0, 0, bcode),
+-        MAKE_LMS6002D_REG_WR(TOP_ENCFG, obj->top_encfg),
+-    };
+-    res = res ? res : lms6002d_spi_post(obj, regs_1, SIZEOF_ARRAY(regs_1));
++    res = lms6002d_restore(obj, saved, SIZEOF_ARRAY(saved), res);
++    if (!res)
++        obj->rclpfcal[bcode] = GET_LMS6002D_TOP_DC_CAL_RC_LPF(rcal) | 0x80;
++    obj->tx_frequency = saved_tx_frequency;
+     return res;
+ }
+ 
+ int lms6002d_set_rxfedc(lms6002d_state_t* obj, int8_t dci, int8_t dcq)
+ {
+-    uint16_t regs[] = {
+-        MAKE_LMS6002D_RFE_IN1SEL_DCI(1, dci),
+-        MAKE_LMS6002D_RFE_INLOAD_DCQ(1, dcq),
+-    };
+-    return lms6002d_spi_post(obj, regs, SIZEOF_ARRAY(regs));
++    if (dci < -63 || dci > 63 || dcq < -63 || dcq > 63)
++        return -ERANGE;
++    uint8_t i = dci < 0 ? 0x40 | -dci : dci;
++    uint8_t q = dcq < 0 ? 0x40 | -dcq : dcq;
++    int res = lms6002d_update(obj, RFE_IN1SEL_DCI, 0x7f, i);
++    return res ? res : lms6002d_update(obj, RFE_INLOAD_DCQ, 0x7f, q);
+ }
+ 
+ int lms6002d_set_txvga1_dc(lms6002d_state_t* obj, uint8_t dci, uint8_t dcq)
+@@ -912,11 +807,12 @@ int lms6002d_set_tia_rfb(lms6002d_state_t* obj, uint8_t value)
+ 
+ int lms6002d_set_rxfe_ip2corr(lms6002d_state_t* obj, int8_t i, int8_t q)
+ {
+-    uint16_t regs[] = {
+-        MAKE_LMS6002D_RFE_XLD_IP2I(0, i),
+-        MAKE_LMS6002D_RFE_IP2Q(q),
+-    };
+-    return lms6002d_spi_post(obj, regs, SIZEOF_ARRAY(regs));
++    if (i < -63 || i > 63 || q < -63 || q > 63)
++        return -ERANGE;
++    uint8_t ci = i < 0 ? 0x40 | -i : i;
++    uint8_t cq = q < 0 ? 0x40 | -q : q;
++    int res = lms6002d_update(obj, RFE_XLD_IP2I, 0x7f, ci);
++    return res ? res : lms6002d_update(obj, RFE_IP2Q, 0x7f, cq);
+ }
+ 
+ int lms6002d_rf_loopback_en(lms6002d_state_t* obj)
+diff --git a/src/lib/hw/lms6002d/lms6002d.h b/src/lib/hw/lms6002d/lms6002d.h
+index 6be2f17..75c2893 100644
+--- a/src/lib/hw/lms6002d/lms6002d.h
++++ b/src/lib/hw/lms6002d/lms6002d.h
+@@ -24,6 +24,8 @@ struct lms6002d_state {
+     // uint8_t topclk_0x05; // TOP_ENCFG - TX/RX power down
+ 
+     uint8_t rclpfcal[LPF_BANDS]; //Calibrated values for LPF
++    uint64_t rx_frequency, tx_frequency; // Hz from the programmed PLL divider
++    unsigned rx_bandwidth, tx_bandwidth; // Nominal full RF bandwidth, 0 = bypass
+ 
+     uint8_t top_encfg;
+     uint8_t top_enreg;
+diff --git a/src/lib/hw/si5332/si5332.c b/src/lib/hw/si5332/si5332.c
+index d03664a..8b9e8a7 100644
+--- a/src/lib/hw/si5332/si5332.c
++++ b/src/lib/hw/si5332/si5332.c
+@@ -357,7 +357,7 @@ static int si5532_get_state(lldev_t dev, subdev_t subdev, lsopaddr_t lsopaddr, c
+         return tag == USDR_LOG_ERROR ? -EILSEQ : 0;
+     }
+ 
+-    return res;
++    return (state == 0x01 || state == 0x02) ? 0 : -ETIMEDOUT;
+ }
+ 
+ int si5332_init(lldev_t dev, subdev_t subdev, lsopaddr_t lsopaddr, unsigned div, bool ext_in2, bool rv)
+@@ -528,6 +528,9 @@ int si5532_set_ext_clock_sw(lldev_t dev, subdev_t subdev, lsopaddr_t lsopaddr, b
+ int si5332_set_layout(lldev_t dev, subdev_t subdev, lsopaddr_t lsopaddr,
+                       struct si5332_layout_info* nfo, bool old, unsigned lodiv, unsigned *vcofreq /*, unsigned* altref*/)
+ {
++    if (!nfo || !nfo->out || !nfo->infreq || nfo->infreq > 100000000 ||
++        lodiv < si5332_hsdiv_min || lodiv > si5332_hsdiv_max)
++        return -EINVAL;
+     unsigned imul = (si5332_Fvco_min + nfo->out - 1) / nfo->out;
+     unsigned hsdiv;
+     unsigned odiv = 1;
+@@ -564,7 +567,7 @@ int si5332_set_layout(lldev_t dev, subdev_t subdev, lsopaddr_t lsopaddr,
+ 
+     unsigned error;
+     for (idpa_den = 2; idpa_den < 32767; idpa_den++) {
+-        error = (idpa_den * idpa_frac) % pllfreq;
++        error = ((uint64_t)idpa_den * idpa_frac) % pllfreq;
+         if (error == 0)
+             break;
+     }
+@@ -582,10 +585,6 @@ int si5332_set_layout(lldev_t dev, subdev_t subdev, lsopaddr_t lsopaddr,
+         }
+     }
+ 
+-    if (vcofreq) {
+-        *vcofreq = vco;
+-    }
+-
+     USDR_LOG("5332", USDR_LOG_INFO, "VCO=%u IDPA_INTG=%u IDPA_RES/DEV=%u/%u HSDIV=%u ODIV=%u JDIV=%d MXLO=%u OLD=%d\n",
+              vco, idpa_intg, idpa_res, idpa_den, hsdiv, odiv, jdiv, vco / lodiv, old);
+ 
+@@ -645,7 +644,15 @@ int si5332_set_layout(lldev_t dev, subdev_t subdev, lsopaddr_t lsopaddr,
+             return res;
+     }
+ 
+-    return si5532_get_state(dev, subdev, lsopaddr, "AFTER SET_LAYOUT");
++    res = si5532_get_state(dev, subdev, lsopaddr, "AFTER SET_LAYOUT");
++    if (!res) {
++        uint64_t numerator = (uint64_t)pllfreq * ((uint64_t)idpa_intg * idpa_den + idpa_res);
++        unsigned actual_vco = (numerator + 64 * idpa_den) / (128 * idpa_den);
++        if (vcofreq)
++            *vcofreq = actual_vco;
++        nfo->out = jdiv ? nfo->infreq / odiv : actual_vco / (hsdiv * odiv);
++    }
++    return res;
+ }
+ 
+ int si5332_set_port3_en(lldev_t dev, subdev_t subdev, lsopaddr_t lsopaddr, bool loen, bool txen)
+diff --git a/src/lib/ipblks/dc_estim.c b/src/lib/ipblks/dc_estim.c
+index d905417..e17ea46 100644
+--- a/src/lib/ipblks/dc_estim.c
++++ b/src/lib/ipblks/dc_estim.c
+@@ -44,7 +44,7 @@ int phy_rfe_pwrdc_get(lldev_t d, uint32_t llreg, unsigned acc_norm, int prev_gen
+     int gen, gen_n;
+     int res = 0;
+ 
+-    do {
++    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+         res = res ? res : phy_dc_estim_get(d, llreg, DC_ESTIM_GEN, &gen);
+         if (res)
+             return res;
+@@ -60,7 +60,11 @@ int phy_rfe_pwrdc_get(lldev_t d, uint32_t llreg, unsigned acc_norm, int prev_gen
+             return res;
+ 
+ 
+-    } while (gen != gen_n);
++        if (gen == gen_n) break;
++        if (attempt == 7) return -EAGAIN;
++    }
++
++    if (!acc_norm || !range) return -EINVAL;
+ 
+     double fs_i = val[0];
+     double fs_q = val[1];
+@@ -88,23 +92,25 @@ int phy_do_meas_nco_avg(lldev_t d, uint32_t llreg, unsigned range, int channel,
+     res = res ? res : phy_dc_estim_accum(d, llreg, acc_idx);
+     res = res ? res : phy_dc_estim_start(d, llreg, false);
+     res = res ? res : usleep(1);
+-    res = res ? res : phy_dc_estim_start(d, llreg, true);
+     res = res ? res : phy_dc_estim_get(d, llreg, DC_ESTIM_GEN, &gen);
++    res = res ? res : phy_dc_estim_start(d, llreg, true);
+     if (res)
+         return res;
+ 
+     for (unsigned k = 0; k < 8000; k++) {
+         res = phy_rfe_pwrdc_get(d, llreg, acc_idx, gen, channel, range, &meas1000db);
+-        if (res != -EAGAIN) {
++        if (!res) {
+             accum += meas1000db;
+             break;
+         }
++        if (res != -EAGAIN) return res;
+ 
+         usleep(1000);
+     }
+ 
+     USDR_LL_LOG(d, "XDEV", USDR_LOG_INFO, "MEAS[%d] = %.3f\n", channel, meas1000db/1e3);
++    if (res) return res == -EAGAIN ? -ETIMEDOUT : res;
+     *oaccum = accum;
+-    return res;
++    return 0;
+ }
+ 
+diff --git a/src/lib/ipblks/streams/stream_sfetrx4_dma32.c b/src/lib/ipblks/streams/stream_sfetrx4_dma32.c
+index bbf373e..6b63295 100644
+--- a/src/lib/ipblks/streams/stream_sfetrx4_dma32.c
++++ b/src/lib/ipblks/streams/stream_sfetrx4_dma32.c
+@@ -7,6 +7,9 @@
+ #include <stdio.h>
+ #include <assert.h>
+ #include <inttypes.h>
++#include <stdatomic.h>
++
++static _Atomic uint64_t rx_lease_sequence;
+ 
+ #include "stream_sfetrx4_dma32.h"
+ 
+@@ -90,6 +93,12 @@ struct stream_sfetrx_dma32 {
+ 
+     uint64_t hw_pwr_mask; // Powered chans (hw)
+     uint8_t pack_3x16;
++    bool native_ci16, rx_fault, lease_external;
++    unsigned overflow_reg;
++    void *leased;
++    uint64_t lease_token;
++    uint64_t block_lost;
++
+ };
+ typedef struct stream_sfetrx_dma32 stream_sfetrx_dma32_t;
+ 
+@@ -104,6 +113,7 @@ int _sfetrx4_destroy(stream_handle_t* str)
+     stream_sfetrx_dma32_t* stream = (stream_sfetrx_dma32_t*)str;
+     lldev_t dev = stream->base.dev->dev;
+ 
++    if (stream->leased && stream->lease_external) return -EBUSY;
+     USDR_LL_LOG(dev, "DSTR", USDR_LOG_DEBUG, "Destroying strem %d\n", stream->ll_streamo);
+     int res;
+ 
+@@ -127,16 +137,15 @@ int _sfetrx4_destroy(stream_handle_t* str)
+     lowlevel_ops_t* dops = lowlevel_get_ops(dev);
+     res = dops->stream_deinitialize(dev, 0, stream->ll_streamo);
+ 
+-    // Cleanup device state
++    // Keep the handle valid if the kernel could not safely retire the DMA ring.
++    if (res) return res;
+     free(stream);
+     return res;
+ }
+ 
+ static
+-int _sfetrx4_stream_recv(stream_handle_t* str,
+-                         char** stream_buffs,
+-                         unsigned timeout,
+-                         struct usdr_dms_recv_nfo* nfo)
++int _sfetrx4_acquire_buffer(stream_handle_t* str, unsigned timeout,
++                          struct usdr_dms_recv_nfo* nfo)
+ {
+     int res;
+     struct lowlevel_ops* ops;
+@@ -146,9 +155,11 @@ int _sfetrx4_stream_recv(stream_handle_t* str,
+     if (stream->type != USDR_ZCPY_RX)
+         return -ENOTSUP;
+ 
+-    uint64_t oob_data[2];
++    if (stream->leased) return -EBUSY;
++    if (stream->rx_fault) return -EOVERFLOW;
++    uint64_t oob_data[2] = {0};
+     unsigned oob_size = sizeof(oob_data);
+-    char* dma_buf;
++    char* dma_buf = NULL;
+ 
+     if (stream->rcnt == 0) {
+         // TODO: Issue rx ready, should be put inside
+@@ -162,9 +173,18 @@ int _sfetrx4_stream_recv(stream_handle_t* str,
+     res = ops->recv_dma_wait(dev, 0,
+                              stream->ll_streamo,
+                              (void**)&dma_buf, &oob_data, &oob_size, timeout);
+-    if (res == -ETIMEDOUT) {
+-    } else if (res < 0)
+-        return res;
++    if (res < 0) return res;
++    if (!dma_buf) return -EIO;
++    stream->leased = dma_buf;
++    // Fail closed if loss occurred before the frontend timestamp generator.
++    uint32_t overflow = 0;
++    res = stream->overflow_reg ? lowlevel_reg_rd32(dev, 0, stream->overflow_reg, &overflow) : 0;
++    if (res || (overflow & 1) || oob_size < sizeof(oob_data)) {
++        stream->rx_fault = true;
++        int release = ops->recv_dma_release(dev, 0, stream->ll_streamo, dma_buf);
++        if (!release) stream->leased = NULL;
++        return res ? res : release ? release : (overflow & 1) ? -EOVERFLOW : -EIO;
++    }
+ 
+     uint32_t dma_stat = oob_data[1];
+     unsigned dbno_inram;     // BUF# filled in FIFO RAM
+@@ -195,19 +215,13 @@ int _sfetrx4_stream_recv(stream_handle_t* str,
+ #define santify_fail false
+ #endif
+ 
+-    if (res == -ETIMEDOUT) {
+-        USDR_LL_LOG(dev, "UDMS", santify_fail ? USDR_LOG_ERROR : USDR_LOG_INFO, "Recv %016" PRIx64 ".%016" PRIx64 " TIMEDOUT:%d buf=%p seq=%16" PRIu64 " %d.%2d/%2d/%2d/%2d/%2d\n", oob_data[0], oob_data[1], res, dma_buf,
+-                 stream->rcnt, srdy, fe_stat, dbno_inram, dbno_xfred, dbno_ntfysent, dbno_confirmed);
+-        return res;
+-    }
+-
+     if (oob_data[0] & 0xffffff) {
+         unsigned pkt_lost = oob_data[0] & 0xffffff;
+         USDR_LL_LOG(dev, "UDMS", santify_fail ? USDR_LOG_ERROR : USDR_LOG_INFO, "Recv %016" PRIx64 ".%016" PRIx64 " EXTRA:%d buf=%p seq=%16" PRIu64 " %d.%2d/%2d/%2d/%2d/%2d\n", oob_data[0], oob_data[1], res, dma_buf,
+                  stream->rcnt, srdy, fe_stat, dbno_inram, dbno_xfred, dbno_ntfysent, dbno_confirmed);
+ 
+         stream->stats.fe_drop += pkt_lost;
+-        stream->r_ts += stream->pkt_symbs * pkt_lost;
++        stream->r_ts += (uint64_t)stream->pkt_symbs * pkt_lost;
+     } else if ((oob_data[0] >> 32) != stream->burst_mask) {
+         USDR_LL_LOG(dev, "UDMS", santify_fail ? USDR_LOG_ERROR : USDR_LOG_INFO, "Recv %016" PRIx64 ".%016" PRIx64 " [%08x] EXTRA:%d buf=%p seq=%16" PRIu64 " %d.%2d/%2d/%2d/%2d/%2d\n", oob_data[0], oob_data[1], stream->burst_mask, res, dma_buf,
+                 stream->rcnt, srdy, fe_stat, dbno_inram, dbno_xfred, dbno_ntfysent, dbno_confirmed);
+@@ -218,32 +232,79 @@ int _sfetrx4_stream_recv(stream_handle_t* str,
+                  stream->rcnt, srdy, fe_stat, dbno_inram, dbno_xfred, dbno_ntfysent, dbno_confirmed);
+     }
+ 
++    if ((oob_data[0] >> 32) != stream->burst_mask) {
++        stream->rx_fault = true;
++        int release = ops->recv_dma_release(dev, 0, stream->ll_streamo, dma_buf);
++        if (!release) stream->leased = NULL;
++        return release ? release : -EOVERFLOW;
++    }
++    stream->block_lost = (oob_data[0] & 0xffffff) * (uint64_t)stream->pkt_symbs;
++    stream->lease_token = atomic_fetch_add_explicit(&rx_lease_sequence, 1, memory_order_relaxed) + 1;
++
+     stream->stats.pktok ++;
+     stream->stats.wirebytes += stream->pkt_bytes;
+     stream->stats.symbols += stream->pkt_symbs;
+ 
+-    // Data transformation
+-    stream->tf_data((const void**)&dma_buf, stream->pkt_bytes, (void**)stream_buffs, stream->host_bytes);
+     stream->rcnt++;
+ 
+     if (nfo) {
+         nfo->fsymtime = stream->r_ts;
+         nfo->totsyms = stream->pkt_symbs;
+-        nfo->totlost = stream->stats.fe_drop;
++        uint64_t lost = stream->stats.fe_drop * stream->pkt_symbs;
++        nfo->totlost = lost > UINT32_MAX ? UINT32_MAX : (unsigned)lost;
+         nfo->extra = (oob_size >= 16) ? oob_data[1] : 0;
+     }
+ 
+     stream->r_ts += stream->pkt_symbs;
+ 
+-    // Release DMA buffer
+-    res = ops->recv_dma_release(dev, 0,
+-                                stream->ll_streamo, dma_buf);
+-    if (res)
+-        return res;
++    return 0;
++}
+ 
++static int _sfetrx4_release_buffer(stream_sfetrx_dma32_t *stream)
++{
++    lldev_t dev = stream->base.dev->dev;
++    int res = lowlevel_get_ops(dev)->recv_dma_release(dev, 0, stream->ll_streamo, stream->leased);
++    if (!res) { stream->leased = NULL; stream->lease_external = false; }
++    return res;
++}
++
++static int _sfetrx4_acquire(stream_handle_t *str, unsigned timeout, usdr_dms_rx_block_t *block)
++{
++    stream_sfetrx_dma32_t *stream = (stream_sfetrx_dma32_t*)str;
++    if (!stream->native_ci16 || stream->type != USDR_ZCPY_RX) return -EOPNOTSUPP;
++    usdr_dms_recv_nfo_t nfo = {0};
++    int res = _sfetrx4_acquire_buffer(str, timeout, &nfo);
++    if (res) return res;
++    stream->lease_external = true;
++    *block = (usdr_dms_rx_block_t){
++        .data = stream->leased, .bytes = stream->pkt_bytes, .samples = stream->pkt_symbs,
++        .format = USDR_DMS_NATIVE_CI16_LE, .timestamp = nfo.fsymtime,
++        .lost_samples = stream->block_lost, .token = stream->lease_token,
++        .flags = stream->block_lost ? USDR_DMS_BLOCK_DISCONTINUITY : 0,
++    };
+     return 0;
+ }
+ 
++static int _sfetrx4_release(stream_handle_t *str, const usdr_dms_rx_block_t *block)
++{
++    stream_sfetrx_dma32_t *stream = (stream_sfetrx_dma32_t*)str;
++    if (!stream->leased || block->data != stream->leased || block->token != stream->lease_token)
++        return -EINVAL;
++    return _sfetrx4_release_buffer(stream);
++}
++
++static int _sfetrx4_stream_recv(stream_handle_t *str, char **buffers, unsigned timeout,
++                              usdr_dms_recv_nfo_t *nfo)
++{
++    stream_sfetrx_dma32_t *stream = (stream_sfetrx_dma32_t*)str;
++    if (!buffers) return -EINVAL;
++    int res = _sfetrx4_acquire_buffer(str, timeout, nfo);
++    if (res) return res;
++    const void *input = stream->leased;
++    stream->tf_data(&input, stream->pkt_bytes, (void**)buffers, stream->host_bytes);
++    return _sfetrx4_release_buffer(stream);
++}
++
+ static int _extx_burstup(unsigned total_samples, unsigned brst_samples_max, unsigned* plgbrst)
+ {
+     unsigned lgbursts = 0;
+@@ -507,6 +568,8 @@ static int _sfetrx4_op(stream_handle_t* str,
+     lldev_t dev = stream->base.dev->dev;
+     int res;
+     bool start;
++    if (stream->leased && stream->lease_external) return -EBUSY;
++    if (stream->rx_fault && (command == USDR_DMS_START || command == USDR_DMS_START_AT)) return -EOVERFLOW;
+     switch (command) {
+     case USDR_DMS_START:
+     case USDR_DMS_START_AT:
+@@ -559,6 +622,11 @@ static
+ int _sfetrx4_option_set(stream_handle_t* str, const char* name, int64_t in_val)
+ {
+     stream_sfetrx_dma32_t* stream = (stream_sfetrx_dma32_t*)str;
++    if (strcmp(name, "rx-overflow-reg") == 0) {
++        if (in_val <= 0 || in_val >= 1024 || stream->rcnt) return -EINVAL;
++        stream->overflow_reg = (unsigned)in_val;
++        return 0;
++    }
+     if (strcmp(name, "ready") == 0) {
+         if (stream->type != USDR_ZCPY_RX)
+             return -ENOTSUP;
+@@ -654,6 +722,8 @@ static const struct stream_ops s_sfetr4_dma32_ops = {
+     .stat = &_sfetrx4_stat,
+     .option_get = &_sfetrx4_option_get,
+     .option_set = &_sfetrx4_option_set,
++    .acquire = &_sfetrx4_acquire,
++    .release = &_sfetrx4_release,
+ };
+ 
+ 
+@@ -835,7 +905,8 @@ static int initialize_stream_rx_32(device_t* device,
+     if (res)
+         return res;
+ 
+-    strdev = (stream_sfetrx_dma32_t*)malloc(sizeof(stream_sfetrx_dma32_t));
++    strdev = calloc(1, sizeof(*strdev));
++    if (!strdev) { dops->stream_deinitialize(device->dev, 0, sid); return -ENOMEM; }
+     //usdr_dmo_init(&strdev->obj_stream, &s_dms_ops);
+     //strdev->parent = device;
+     strdev->base.dev = device;
+@@ -855,6 +926,8 @@ static int initialize_stream_rx_32(device_t* device,
+ 
+     strdev->wire_bps = 8 * strdev->pkt_bytes / strdev->pkt_symbs / strdev->channels;
+ 
++    strdev->native_ci16 = logicchs == 1 && bfmt.complex && bfmt.bits == 16 &&
++        !pack_3x16 && strdev->pkt_bytes == 4 * strdev->pkt_symbs;
+     strdev->tf_data = funcs.cfunc;
+     strdev->tf_size = funcs.sfunc;
+ 
+@@ -1076,9 +1149,8 @@ static int initialize_stream_tx_32(device_t* device,
+     lowlevel_ops_t* dops = lowlevel_get_ops(device->dev);
+     unsigned max_mtu = sfe_tx4_mtu_get(&sc);
+ 
+-    strdev = (stream_sfetrx_dma32_t*)malloc(sizeof(stream_sfetrx_dma32_t));
+-    if (!strdev)
+-        return -ENOMEM;
++    strdev = calloc(1, sizeof(*strdev));
++    if (!strdev) return -ENOMEM;
+ 
+     sparams.streamno = 1;
+     sparams.flags = 1;
+diff --git a/src/lib/ipblks/streams/streams_api.h b/src/lib/ipblks/streams/streams_api.h
+index d8b4dbe..42aebad 100644
+--- a/src/lib/ipblks/streams/streams_api.h
++++ b/src/lib/ipblks/streams/streams_api.h
+@@ -33,6 +33,8 @@ struct stream_ops {
+     // Custom stream options
+     int (*option_get)(stream_handle_t*, const char* name, int64_t* out_val);
+     int (*option_set)(stream_handle_t*, const char* name, int64_t in_val);
++    int (*acquire)(stream_handle_t*, unsigned timeout_ms, usdr_dms_rx_block_t*);
++    int (*release)(stream_handle_t*, const usdr_dms_rx_block_t*);
+ };
+ typedef struct stream_ops stream_ops_t;
+ 
+diff --git a/src/lib/lowlevel/pcie_uram/driver/usdr_pcie_uram.c b/src/lib/lowlevel/pcie_uram/driver/usdr_pcie_uram.c
+index dc3be8c..2c6deb5 100644
+--- a/src/lib/lowlevel/pcie_uram/driver/usdr_pcie_uram.c
++++ b/src/lib/lowlevel/pcie_uram/driver/usdr_pcie_uram.c
+@@ -31,6 +31,8 @@
+ #include <linux/aer.h>
+ #include <linux/bitmap.h>
+ #include <linux/pm_runtime.h>
++#include <linux/kref.h>
++#include <linux/mutex.h>
+ 
+ 
+ #include "./pcie_uram_driver_if.h"
+@@ -112,8 +114,6 @@ enum device_flags {
+ 
+     DEV_READY_MASK = DEV_VALID | DEV_INITIALIZED,
+ 
+-    // Do not call DMA sync on fully cache coherent systems (extra optimization)
+-    DEV_NO_DMA_SYNC = 16,
+ };
+ 
+ struct usdr_dmabuf {
+@@ -137,6 +137,9 @@ struct stream_core_state_rxbrst {
+ };
+ 
+ struct stream_state {
++    struct kref refs;
++    struct pci_dev *pdev;
++    atomic_t mappings;
+     unsigned dma_buffer_flags;
+     unsigned dma_buffs; //Number of allocated dma buffers
+     unsigned dma_buff_size; //Size of each buffer in bytes
+@@ -213,6 +216,7 @@ struct usdr_dev {
+ 	struct pci_dev* pdev;
+ 
+ 	spinlock_t slock;
++    struct mutex io_lock; // Serialize configuration, mappings and ioctl consumers.
+ 
+ 	void __iomem *bar_addr;
+ 
+@@ -516,8 +520,7 @@ irq_found:
+         uint32_t data[4];
+         unsigned event_no, flags, l;
+ 
+-        for (l = 0; l < 4; l++)
+-            data[l] = /*be32_to_cpu*/(bptr[(4 * i + l) & 0x3ff]);
++        data[0] = READ_ONCE(bptr[(4 * i) & 0x3ff]);
+ 
+         //event_no = data[3] >> 29;
+         //flags = (data[3] & (1u<<28)) ? 1 : 0;
+@@ -528,6 +531,15 @@ irq_found:
+         if (flags != ((i >> 8) & 1)) {
+             break;
+         }
++        // The notification's flag is its FIRST DWORD. A later notification
++        // may be arriving while this IRQ drains the ring, so its flag alone
++        // does not publish the trailing words. An ordered PIO read response
++        // drains that PCIe write before we consume its payload. Register 0 is
++        // a side-effect-free status read; this costs one read per notification.
++        (void)usdr_readl(d, 0);
++        dma_rmb();
++        for (l = 1; l < 4; l++)
++            data[l] = READ_ONCE(bptr[(4 * i + l) & 0x3ff]);
+         if (i % 32 == 31) {
+             do_cnf = (i << 1) & 0x3ff;
+         }
+@@ -598,7 +610,7 @@ static int usdrfd_open(struct inode *inode, struct file *filp)
+ 	filp->private_data = dev;
+ 
+ 	spin_lock_irqsave(&dev->slock, flags);
+-        if ((dev->dev_mask & DEV_EXCLUSIVE) == 0) {
++        if ((dev->dev_mask & (DEV_VALID | DEV_EXCLUSIVE)) == DEV_VALID) {
+                 dev->dev_mask |= DEV_EXCLUSIVE;
+ 		granted = 1;
+ 	}
+@@ -617,21 +629,25 @@ static int usdrfd_open(struct inode *inode, struct file *filp)
+ 	return (granted) ? 0 : -EBUSY;
+ }
+ 
++static int usdr_stream_free(struct usdr_dev *d, unsigned sno);
++
+ static int usdrfd_release(struct inode *inode, struct file *filp)
+ {
+-        struct usdr_dev *usdrdev = filp->private_data;
+-	unsigned long flags;
+-
+-        if ((usdrdev->dev_mask & DEV_VALID) == 0) {
+-                printk(KERN_INFO PFX "usdr:%d dev is invalid!\n", usdrdev->devno);
+-		return 0;
+-	}
+-
+-        spin_lock_irqsave(&usdrdev->slock, flags);
+-        usdrdev->dev_mask &= ~DEV_EXCLUSIVE;
+-        spin_unlock_irqrestore(&usdrdev->slock, flags);
+-
+-	return 0;
++    struct usdr_dev *d = filp->private_data;
++    unsigned long flags;
++    unsigned i;
++    mutex_lock(&d->io_lock);
++    if (d->dev_mask & DEV_VALID) {
++        for (i = 0; i < d->dl.streams_count; ++i) {
++            int res = usdr_stream_free(d, i);
++            if (res) dev_err(&d->pdev->dev, "Retaining stream %u DMA storage after failed stop: %d\n", i, res);
++        }
++    }
++    spin_lock_irqsave(&d->slock, flags);
++    d->dev_mask &= ~DEV_EXCLUSIVE;
++    spin_unlock_irqrestore(&d->slock, flags);
++    mutex_unlock(&d->io_lock);
++    return 0;
+ }
+ 
+ static ssize_t usdrfd_read(struct file *filp, char __user *buf, size_t count,
+@@ -673,41 +689,57 @@ static __poll_t usdrfd_poll(struct file *filp, poll_table *wait)
+ 	return events;
+ }
+ 
+-static int usdr_stream_free(struct usdr_dev *usdrdev, unsigned sno)
++static void usdr_stream_put(struct kref *ref)
+ {
++    struct stream_state *s = container_of(ref, struct stream_state, refs);
+     unsigned i;
+-    struct stream_state* s;
+-    if (sno >= usdrdev->dl.streams_count)
+-        return -EINVAL;
+-
+-    s = usdrdev->streams[sno];
+-    if (!s)
+-        return 0;
+-
+-    // Release DMA buffers
+-    if (usdrdev->dl.stream_core[sno] == USDR_MAKE_COREID(USDR_CS_STREAM, USDR_SC_TXDMA_OLD)) {
+-        usdr_reg_wr32(usdrdev, usdrdev->dl.stream_cfg_base[sno] + s->dma_buffs, 0);
+-    } else {
+-        usdr_reg_wr32(usdrdev, usdrdev->dl.stream_cfg_base[sno] + 7 * s->dma_buffs, 0);
+-    }
+-
+-    // Destroy buffers
+-    for (i = s->dma_buffs; i > 0; i--) {
+-        dma_free_attrs(&usdrdev->pdev->dev,
+-                       s->dma_buff_size,
+-                       s->dmab[i - 1].kvirt,
+-                       s->dmab[i - 1].phys,
++    for (i = 0; i < s->dma_buffs; ++i)
++        dma_free_attrs(&s->pdev->dev, s->dma_buff_size, s->dmab[i].kvirt, s->dmab[i].phys,
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 5, 0)
+                        &s->dma_attr);
+ #else
+                        s->dma_buffer_flags);
+ #endif
++    pci_dev_put(s->pdev);
++    kfree(s);
++}
+ 
++static int usdr_stream_quiesce(struct usdr_dev *d, unsigned sno)
++{
++    unsigned base = d->dl.stream_cnf_base[sno], status, n;
++    bool rx = d->dl.stream_core[sno] == USDR_MAKE_COREID(USDR_CS_STREAM, USDR_SC_RXDMA_BRSTN);
++    bool tx = d->dl.stream_core[sno] == USDR_MAKE_COREID(USDR_CS_STREAM, USDR_SC_TXDMA_OLD);
++    if (!rx && !tx) return -EOPNOTSUPP;
++    // Changing the allocation limit to zero does not stop the DMA engine.
++    usdr_reg_wr32(d, base + (rx ? 1 : 2), 0);
++    for (n = 0; n < 1000; ++n) {
++        status = usdr_reg_rd32(d, base + (rx ? 2 : 16));
++        if (status == ~0u) return -EIO;
++        // Matched RX RTL keeps bit 31 high through the final accepted PCIe
++        // payload beat. The non-relaxed read response orders prior DMA writes.
++        if (rx ? !(status & 0xc0000000) : ((status & 0x81) == 1)) {
++            if (tx && !pci_wait_for_pending_transaction(d->pdev)) return -ETIMEDOUT;
++            return 0;
++        }
++        usleep_range(100, 200);
+     }
++    return -ETIMEDOUT;
++}
+ 
+-    kfree(s);
+-
+-    usdrdev->streams[sno] = 0;
++static int usdr_stream_free(struct usdr_dev *d, unsigned sno)
++{
++    struct stream_state *s;
++    int res;
++    if (sno >= d->dl.streams_count) return -EINVAL;
++    s = d->streams[sno];
++    if (!s) return 0;
++    if (d->dev_mask & DEV_VALID) {
++        if (atomic_read(&s->mappings)) return -EBUSY;
++        res = usdr_stream_quiesce(d, sno);
++        if (res) return res; // Never free storage while DMA may still use it.
++    }
++    d->streams[sno] = NULL;
++    kref_put(&s->refs, usdr_stream_put);
+     return 0;
+ }
+ 
+@@ -717,6 +749,8 @@ static int usdr_device_initialie(struct usdr_dev *usdrdev)
+     int res;
+ 
+     //Sanity check
++    if (usdrdev->dl.streams_count > MAX_STREAMS || usdrdev->dl.bucket_count > MAX_BUCKETS)
++        return -EINVAL;
+     if ((usdrdev->dl.spi_cnt > MAX_SPI_COUNT) ||
+             (usdrdev->dl.i2c_cnt > MAX_I2C_COUNT) ||
+             (usdrdev->dl.idx_regsp_cnt > MAX_INDEXED_SPACES) ||
+@@ -954,6 +988,10 @@ static int usdr_stream_initialize(struct usdr_dev *usdrdev,
+     flags = 0;
+ 
+     if ((s = usdrdev->streams[sno])) {
++        int res;
++        if (atomic_read(&s->mappings)) return -EBUSY;
++        res = usdr_stream_quiesce(usdrdev, sno);
++        if (res) return res;
+         if ((s->dma_buffs == sdma->dma_bufs) &&
+                 (s->dma_buff_size >= newsz) &&
+                 (s->dma_buffer_flags == flags)) {
+@@ -962,13 +1000,17 @@ static int usdr_stream_initialize(struct usdr_dev *usdrdev,
+         }
+ 
+         // Reinitialize buffers
+-        usdr_stream_free(usdrdev, sno);
++        res = usdr_stream_free(usdrdev, sno);
++        if (res) return res;
+     }
+ 
+     s = (struct stream_state*)kzalloc(sizeof(*s) + (sdma->dma_bufs * sizeof(struct usdr_dmabuf)), GFP_KERNEL);
+     if (!s)
+         return -ENOMEM;
+ 
++    kref_init(&s->refs);
++    atomic_set(&s->mappings, 0);
++    s->pdev = pci_dev_get(usdrdev->pdev);
+     s->dma_buffs = sdma->dma_bufs;
+     s->dma_buff_size = newsz;
+     s->dma_buffer_flags = flags;
+@@ -1054,6 +1096,7 @@ failed_alloc:
+                        s->dma_buffer_flags);
+ #endif
+     }
++    pci_dev_put(s->pdev);
+     kfree(s);
+     return -ENOMEM;
+ }
+@@ -1106,16 +1149,14 @@ static int usdr_stream_wait_or_alloc(struct usdr_dev *usdrdev, unsigned long sno
+         //Return buffno if available; do cache flash if needed
+         to_hz = to * HZ / 1000;
+         res = wait_event_interruptible_timeout(usdrdev->irq_ev_wq[eno],
+-                                            (cnt = atomic_xchg(&usdrdev->irq_ev_cnt[eno], 0)) != 0,
++                                            (cnt = atomic_xchg(&usdrdev->irq_ev_cnt[eno], 0)) != 0 || !(READ_ONCE(usdrdev->dev_mask) & DEV_VALID),
+                                             to_hz);
++        if (!(READ_ONCE(usdrdev->dev_mask) & DEV_VALID)) return -ENODEV;
+         if (res == 0) {
+-            BUG_ON(cnt != 0);
+             return -ETIMEDOUT;
+         } else if (res < 0) {
+             return res;
+-        } else {
+-            BUG_ON(cnt == 0);
+-        }
++        } else if (cnt == 0) return -EIO;
+     }
+ 
+     max = usdrdev->streaming[sno].stat_wptr;
+@@ -1159,28 +1200,9 @@ static int usdr_stream_wait_or_alloc(struct usdr_dev *usdrdev, unsigned long sno
+     	*oob_length = oobcnt * 16;
+     }
+ 
+-    // flush_cache_range(vma, start, end);
+-    if (op_wait && ((usdrdev->dev_mask & DEV_NO_DMA_SYNC) == 0)) {
+-        for (i = 0; i < cnt; i++) {
+-            u64 bno = usdrdev->streams[sno]->abuffer_no + i;
+-            unsigned idx = bno % usdrdev->streams[sno]->dma_buffs;
+-
+-            //dev_err(&usdrdev->pdev->dev, "Buffer_W %ld - %d \n", (long)bno, idx);
+-            dma_sync_single_for_cpu(&usdrdev->pdev->dev,
+-                                    usdrdev->streams[sno]->dmab[idx].phys,
+-                                    usdrdev->streams[sno]->dma_buff_size, DMA_FROM_DEVICE);
+-        }
+-        usdrdev->streams[sno]->abuffer_no += cnt;
+-    }
+-
+-    //dma_sync_single_for_cpu()
+-    // TODO FLUSH CACHE on non-coherent devices
+-    // TODO: this works only on non-muxed interrupts!!!
+-    //BUG_ON(cnt > 0xff);
+-    //bptr = usdrdev->streams[sno]->cores.rxbrst.bufptr;
+-    //res = cnt | (bptr << 12);
+-    //usdrdev->streams[sno]->cores.rxbrst.bufptr = (bptr + cnt) & usdrdev->streams[sno]->cores.rxbrst.bmsk;
+-    //return res;
++    if (cnt > usdrdev->streams[sno]->dma_buffs) return -EOVERFLOW;
++    dma_rmb();
++    if (op_wait) usdrdev->streams[sno]->abuffer_no += cnt;
+ 
+     return cnt;
+ }
+@@ -1195,15 +1217,12 @@ static int usdr_stream_release_or_post(struct usdr_dev *usdrdev, unsigned long s
+     if (res)
+         return res;
+ 
+-    if (op_release && ((usdrdev->dev_mask & DEV_NO_DMA_SYNC) == 0)) {
+-	    u64 bno = usdrdev->streams[sno]->bbuffer_no++;
+-	    unsigned idx = bno % usdrdev->streams[sno]->dma_buffs;
+-
+-        //dev_err(&usdrdev->pdev->dev, "Buffer_R %ld - %d\n", (long)bno, idx);
+-	    dma_sync_single_for_device(&usdrdev->pdev->dev,
+-                                   usdrdev->streams[sno]->dmab[idx].phys,
+-                                   usdrdev->streams[sno]->dma_buff_size, DMA_TO_DEVICE);
++    if (op_release) {
++        struct stream_state *s = usdrdev->streams[sno];
++        if (s->bbuffer_no == s->abuffer_no) return -EINVAL;
++        ++s->bbuffer_no;
+     }
++    dma_wmb();
+ 
+     cnfbase = usdrdev->dl.stream_cnf_base[sno];
+     usdr_reg_wr32(usdrdev, cnfbase, to);
+@@ -1230,7 +1249,7 @@ static int usdr_wait_event(struct usdr_dev *usdrdev,
+     return cnt;
+ }
+ 
+-static long usdrfd_ioctl(struct file *filp,
++static long usdrfd_ioctl_locked(struct file *filp,
+ 			 unsigned int ioctl_num,/* The number of the ioctl */
+ 			 unsigned long ioctl_param) /* The parameter to it */
+ {
+@@ -1286,9 +1305,6 @@ static long usdrfd_ioctl(struct file *filp,
+                     return res;
+ 
+             usdrdev->dev_mask |= DEV_INITIALIZED;
+-#ifdef CONFIG_X86
+-            usdrdev->dev_mask |= DEV_NO_DMA_SYNC;
+-#endif
+         }
+         return 0;
+     case PCIE_DRIVER_HWREG_RD32: {
+@@ -1500,7 +1516,7 @@ static long usdrfd_ioctl(struct file *filp,
+     case PCIE_DRIVER_DMA_WAIT_OOB:
+     case PCIE_DRIVER_DMA_ALLOC_OOB: {
+         struct pcie_driver_woa_oob woaoob;
+-        unsigned data[128];
++        unsigned data[128] = {0};
+         unsigned data_max;
+         if (copy_from_user(&woaoob, uptr, sizeof(woaoob)))
+                 return -EFAULT;
+@@ -1508,6 +1524,7 @@ static long usdrfd_ioctl(struct file *filp,
+         data_max = (sizeof(data) < woaoob.ooblength) ? sizeof(data) : woaoob.ooblength;
+         res = usdr_stream_wait_or_alloc(usdrdev, woaoob.streamnoto, data, &data_max, filp->f_flags & O_NONBLOCK, ioctl_num == PCIE_DRIVER_DMA_WAIT_OOB);
+ 
++        if (res < 0) data_max = 0;
+         if (copy_to_user(woaoob.oobdata, data, data_max))
+             return -EFAULT;
+         if (copy_to_user(uptr + offsetof(struct pcie_driver_woa_oob, ooblength),
+@@ -1524,23 +1541,34 @@ static long usdrfd_ioctl(struct file *filp,
+     return -EINVAL;
+ }
+ 
++static long usdrfd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++    struct usdr_dev *d = filp->private_data;
++    long res;
++    if (mutex_lock_interruptible(&d->io_lock)) return -ERESTARTSYS;
++    res = usdrfd_ioctl_locked(filp, cmd, arg);
++    mutex_unlock(&d->io_lock);
++    return res;
++}
++
+ static void usdrfd_vma_open(struct vm_area_struct *vma)
+ {
+-    printk(KERN_NOTICE PFX "VMA open, virt %lx, phys %lx\n",
+-           vma->vm_start, vma->vm_pgoff << PAGE_SHIFT);
++    struct stream_state *s = vma->vm_private_data;
++    kref_get(&s->refs);
++    atomic_inc(&s->mappings);
+ }
+ 
+ static void usdrfd_vma_close(struct vm_area_struct *vma)
+ {
+-    // printk(KERN_NOTICE PFX "VMA close virt %lx\n", vma->vm_start);
++    struct stream_state *s = vma->vm_private_data;
++    atomic_dec(&s->mappings);
++    kref_put(&s->refs, usdr_stream_put);
+ }
+ 
+-static struct vm_operations_struct usdrfd_remap_vm_ops = {
+-    .open =  usdrfd_vma_open,
+-    .close = usdrfd_vma_close,
++static const struct vm_operations_struct usdrfd_dma_vm_ops = {
++    .open = usdrfd_vma_open, .close = usdrfd_vma_close,
+ };
+ 
+-
+ static int usdrfd_mmap_io(struct usdr_dev *usdrdev, struct vm_area_struct *vma)
+ {
+     unsigned long pfn;
+@@ -1561,11 +1589,10 @@ static int usdrfd_mmap_io(struct usdr_dev *usdrdev, struct vm_area_struct *vma)
+                            vma->vm_page_prot))
+         return -EAGAIN;
+ 
+-    vma->vm_ops = &usdrfd_remap_vm_ops;
+     return 0;
+ }
+ 
+-static int usdrfd_mmap(struct file *filp, struct vm_area_struct *vma)
++static int usdrfd_mmap_locked(struct file *filp, struct vm_area_struct *vma)
+ {
+         struct usdr_dev *usdrdev = filp->private_data;
+ 	unsigned long off;
+@@ -1623,11 +1650,30 @@ static int usdrfd_mmap(struct file *filp, struct vm_area_struct *vma)
+         //dev_notice(&usdrdev->pdev->dev, "Mapping str%db%d to %lx\n",
+         //           streamno, bno, vma->vm_start);
+ 
+-        vma->vm_ops = &usdrfd_remap_vm_ops;
+-	return err;
++        if (!err) {
++            vma->vm_private_data = usdrdev->streams[streamno];
++            vma->vm_ops = &usdrfd_dma_vm_ops;
++            usdrfd_vma_open(vma); // The kernel calls open only on subsequent VMA clones.
++#ifndef HAVE_VM_FLAGS_SET
++            vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
++#else
++            vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
++#endif
++        }
++        return err;
+ }
+ 
+ 
++static int usdrfd_mmap(struct file *filp, struct vm_area_struct *vma)
++{
++    struct usdr_dev *d = filp->private_data;
++    int res;
++    if (mutex_lock_interruptible(&d->io_lock)) return -ERESTARTSYS;
++    res = usdrfd_mmap_locked(filp, vma);
++    mutex_unlock(&d->io_lock);
++    return res;
++}
++
+ struct file_operations usdr_fops = {
+ 	.owner =   THIS_MODULE,
+         .read =    usdrfd_read,
+@@ -1736,6 +1782,7 @@ static int usdr_probe(struct pci_dev *pdev,
+         usdrdev->dev_mask = 0;
+ 
+         spin_lock_init(&usdrdev->slock);
++        mutex_init(&usdrdev->io_lock);
+ 
+         usdrdev->dev_mask = DEV_VALID;
+         usdrdev->cdevice = device_create(usdr_class,
+@@ -1799,6 +1846,13 @@ static void usdr_remove(struct pci_dev *pdev)
+         struct usdr_dev* usdrdev = pci_get_drvdata(pdev);
+ 	printk(KERN_INFO PFX "Removing device %s\n", pci_name(pdev));
+ 
++        WRITE_ONCE(usdrdev->dev_mask, usdrdev->dev_mask & ~DEV_VALID);
++        if (usdrdev->dev_mask & DEV_INITIALIZED)
++            for (i = 0; i < usdrdev->dl.interrupt_count; ++i)
++                wake_up_interruptible(&usdrdev->irq_ev_wq[i]);
++        mutex_lock(&usdrdev->io_lock);
++        pci_clear_master(pdev);
++        pci_wait_for_pending_transaction(pdev);
+         if (usdrdev->dev_mask & DEV_INITIALIZED) {
+ 
+             // Disable notification of all events
+@@ -1844,6 +1898,7 @@ static void usdr_remove(struct pci_dev *pdev)
+ 
+     dev_info(&pdev->dev, "is unlinked, /dev/usdr%d removed\n", usdrdev->devno);
+ 
++    mutex_unlock(&usdrdev->io_lock);
+     //devices--;
+ 	// TODO: Unchain from list and free the memory
+ }
+diff --git a/src/lib/lowlevel/pcie_uram/pcie_uram_main.c b/src/lib/lowlevel/pcie_uram/pcie_uram_main.c
+index 1514896..045f7a8 100644
+--- a/src/lib/lowlevel/pcie_uram/pcie_uram_main.c
++++ b/src/lib/lowlevel/pcie_uram/pcie_uram_main.c
+@@ -37,6 +37,7 @@ struct stream_cache_data {
+     unsigned flags;
+     unsigned bufavail;
+     unsigned bno;
++    unsigned release_bno, rx_outstanding;
+     unsigned bmsk;
+ 
+     unsigned cfg_bufsize;
+@@ -453,6 +454,7 @@ int pcie_uram_stream_initialize(lldev_t dev, subdev_t subdev,
+     sc = &d->scache[pdsc.sno];
+     sc->bufavail = 0;
+     sc->bno = 0;
++    sc->release_bno = sc->rx_outstanding = 0;
+     sc->oob_size = 0;
+     sc->cfg_bufsize = pdsc.dma_buf_sz;
+     sc->cfg_totbuf = pdsc.dma_bufs;
+@@ -509,7 +511,7 @@ int pcie_uram_stream_deinitialize(lldev_t dev, subdev_t subdev, stream_t channel
+     struct pcie_uram_dev* d = (struct pcie_uram_dev*)dev;
+     int res;
+ 
+-    if (channel > DBMAX_SRX + DBMAX_STX)
++    if (channel >= DBMAX_SRX + DBMAX_STX)
+         return -EINVAL;
+     sc = &d->scache[channel];
+     if (sc->cfg_totbuf == 0)
+@@ -523,14 +525,14 @@ int pcie_uram_stream_deinitialize(lldev_t dev, subdev_t subdev, stream_t channel
+         sc->mmaped_area = 0;
+     }
+ 
+-    sc->cfg_totbuf = 0;
+-    sc->cfg_bufsize = 0;
+-    sc->vma_length = 0;
+-
+     res = ioctl(d->fd, PCIE_DRIVER_DMA_UNCONF, channel);
+     if (res)
+         return -errno;
+ 
++    sc->cfg_totbuf = 0;
++    sc->cfg_bufsize = 0;
++    sc->vma_length = 0;
++
+     return 0;
+ }
+ 
+@@ -540,14 +542,16 @@ int pcie_uram_dma_wait_or_alloc(struct pcie_uram_dev* d, bool rx, stream_t chann
+                                 void* oob_ptr, unsigned *oob_size, unsigned timeout)
+ {
+     int res;
+-    unsigned long ctl_param = ((timeout) << 8) | channel;
+-    struct stream_cache_data* sc = &d->scache[channel];
++    unsigned long ctl_param = ((unsigned long)timeout << 8) | channel;
+     void* addr;
+-
+-    if (channel > DBMAX_SRX + DBMAX_STX)
++    if (channel >= DBMAX_SRX + DBMAX_STX || !buffer)
+         return -EINVAL;
+-    if (sc->cfg_totbuf == 0)
++    struct stream_cache_data* sc = &d->scache[channel];
++    *buffer = NULL;
++    if (sc->cfg_totbuf == 0 || !sc->mmaped_area)
+         return -EINVAL;
++    if (oob_ptr && (!oob_size || *oob_size < 16)) return -EINVAL;
++    if (rx && sc->rx_outstanding >= sc->cfg_totbuf) return -EBUSY;
+ 
+     if (sc->bufavail == 0) {
+         if (oob_ptr == NULL) {
+@@ -563,8 +567,11 @@ int pcie_uram_dma_wait_or_alloc(struct pcie_uram_dev* d, bool rx, stream_t chann
+             sc->oob_size = data.ooblength;
+             sc->oob_idx = 0;
+ 
+-            if (res * 16 != data.ooblength) {
++            if (res >= 0 && (data.ooblength > sizeof(sc->oob_cache) ||
++                             (unsigned)res * 16 != data.ooblength)) {
+                 USDR_LL_LOG(&d->ll, "PCIE", USDR_LOG_CRITICAL_WARNING, " RES %d != %d OOBLEN\n", res, sc->oob_size);
++                sc->oob_size = 0;
++                return -EIO;
+             }
+         }
+         if (res < 0) {
+@@ -573,18 +580,18 @@ int pcie_uram_dma_wait_or_alloc(struct pcie_uram_dev* d, bool rx, stream_t chann
+                 USDR_LL_LOG(&d->ll, "PCIE", USDR_LOG_CRITICAL_WARNING, "STR[%d]: PCIe %s dma buffer alloc error: %d!\n",
+                          channel, rx ? "recv" : "send", res);
+             } else if (rx) {
+-                unsigned stat[4];
++                unsigned stat[4] = {0};
+                 // TODO: Remove hardcoded address to upper layer
+                 pcie_reg_op_iommap(d, 4, &stat[0], 12, NULL, 0);
+                 USDR_LL_LOG(&d->ll, "PCIE", USDR_LOG_NOTE, "STR[%d]: PCIe recv dma buffer alloc timed out stat=%08x:%08x:%08x %08x!\n",
+                          channel, stat[0], stat[1], stat[2], stat[3]);
+ 
+-                uint32_t* oob32 = (uint32_t*)oob_ptr;
+-                oob32[0] = stat[0];
+-                oob32[1] = stat[1];
+-                oob32[2] = stat[2];
++                if (oob_ptr && oob_size && *oob_size >= 12) {
++                    memcpy(oob_ptr, stat, 12);
++                    *oob_size = 12;
++                }
+             } else {
+-                unsigned stat[4];
++                unsigned stat[4] = {0};
+                 // TODO: Remove hardcoded address to upper layer
+                 pcie_reg_op_iommap(d, 28, &stat[0], 16, NULL, 0);
+                 USDR_LL_LOG(&d->ll, "PCIE", USDR_LOG_NOTE, "STR[%d]: PCIe send dma buffer alloc timed out stat=%08x:%08x:%08x %08x!\n",
+@@ -594,6 +601,7 @@ int pcie_uram_dma_wait_or_alloc(struct pcie_uram_dev* d, bool rx, stream_t chann
+             //goto restart;
+         }
+ 
++        if (res == 0 || (unsigned)res > sc->cfg_totbuf) return -EIO;
+         sc->bufavail = res;
+         USDR_LL_LOG(&d->ll, "PCIE", (res > 1) ? USDR_LOG_NOTE : USDR_LOG_DEBUG, "STR[%d]: Allocated %d buffs, BNO=%d (%016lx) seq=%16ld OOB_sz=%d\n",
+                  channel, res, sc->bno, (oob_ptr) ? (*(uint64_t*)sc->oob_cache) : 0, sc->seq, sc->oob_size);
+@@ -604,6 +612,7 @@ int pcie_uram_dma_wait_or_alloc(struct pcie_uram_dev* d, bool rx, stream_t chann
+     sc->bno = (sc->bno + 1) & (sc->cfg_totbuf - 1);
+     sc->bufavail--;
+     sc->seq++;
++    if (rx) ++sc->rx_outstanding;
+ 
+     *buffer = addr;
+     if (oob_ptr && oob_size && *oob_size >= 2 * sizeof(uint64_t)) {
+@@ -641,10 +650,14 @@ int pcie_uram_recv_dma_release(lldev_t dev, subdev_t subdev, stream_t channel, v
+     int res;
+     struct pcie_uram_dev* d = (struct pcie_uram_dev*)dev;
+ 
+-    if (channel > DBMAX_SRX + DBMAX_STX)
++    if (channel >= DBMAX_SRX + DBMAX_STX)
++        return -EINVAL;
++
++    struct stream_cache_data *sc = &d->scache[channel];
++    if (!sc->rx_outstanding || !sc->mmaped_area || buffer != sc->mmaped_area[sc->release_bno])
+         return -EINVAL;
+ 
+-    // TODO: don't call ioctl() on mmaped cache coherent interface
++    // The hardware retires buffers in FIFO order.
+     res = ioctl(d->fd, PCIE_DRIVER_DMA_RELEASE, channel);
+     if (res) {
+         res = -errno;
+@@ -654,6 +667,8 @@ int pcie_uram_recv_dma_release(lldev_t dev, subdev_t subdev, stream_t channel, v
+         return res;
+     }
+ 
++    sc->release_bno = (sc->release_bno + 1) & (sc->cfg_totbuf - 1);
++    --sc->rx_outstanding;
+     return 0;
+ }
+ 
+@@ -669,9 +684,10 @@ static
+ int pcie_uram_send_dma_commit(lldev_t dev, subdev_t subdev, stream_t channel, void* buffer, unsigned sz, const void* oob_ptr, unsigned oob_size)
+ {
+     struct pcie_uram_dev* d = (struct pcie_uram_dev*)dev;
++    if (channel >= DBMAX_SRX + DBMAX_STX) return -EINVAL;
+     struct stream_cache_data* sc = &d->scache[channel];
+ 
+-    if (channel > DBMAX_SRX + DBMAX_STX)
++    if (channel >= DBMAX_SRX + DBMAX_STX)
+         return -EINVAL;
+ 
+     if (sc->cfg_bufsize < sz) {
+diff --git a/src/lib/models/dm_stream.c b/src/lib/models/dm_stream.c
+index c536563..551ae9b 100644
+--- a/src/lib/models/dm_stream.c
++++ b/src/lib/models/dm_stream.c
+@@ -10,6 +10,20 @@
+ #include <string.h>
+ #include <assert.h>
+ 
++int usdr_dms_acquire(pusdr_dms_t stream, unsigned timeout_ms, usdr_dms_rx_block_t *block)
++{
++    if (!stream || !block) return -EINVAL;
++    struct stream_handle *h = (struct stream_handle*)stream;
++    memset(block, 0, sizeof(*block));
++    return h->ops->acquire ? h->ops->acquire(h, timeout_ms, block) : -EOPNOTSUPP;
++}
++
++int usdr_dms_release(pusdr_dms_t stream, const usdr_dms_rx_block_t *block)
++{
++    if (!stream || !block) return -EINVAL;
++    struct stream_handle *h = (struct stream_handle*)stream;
++    return h->ops->release ? h->ops->release(h, block) : -EOPNOTSUPP;
++}
+ 
+ int usdr_dms_destroy(pusdr_dms_t stream)
+ {
+diff --git a/src/lib/models/dm_stream.h b/src/lib/models/dm_stream.h
+index f2076f3..8e6fc00 100644
+--- a/src/lib/models/dm_stream.h
++++ b/src/lib/models/dm_stream.h
+@@ -97,6 +97,28 @@ struct usdr_dms_recv_nfo {
+ };
+ typedef struct usdr_dms_recv_nfo usdr_dms_recv_nfo_t;
+ 
++enum usdr_dms_native_format { USDR_DMS_NATIVE_CI16_LE = 1 };
++enum usdr_dms_block_flags { USDR_DMS_BLOCK_DISCONTINUITY = 1 };
++
++// Read-only native DMA storage, valid until release. One outstanding block per
++// stream. Serialize calls on a stream; release before stop, destroy or device
++// close. Unsupported wire layouts return -EOPNOTSUPP without consuming data.
++// CI16_LE is interleaved signed 16-bit I,Q. No conversion or sample copy occurs.
++struct usdr_dms_rx_block {
++    const void *data;
++    size_t bytes;
++    unsigned samples;
++    unsigned format;
++    dm_time_t timestamp;
++    uint64_t lost_samples; // Samples lost immediately before this block
++    uint64_t token;        // Opaque lease; stale/wrong releases are rejected
++    unsigned flags;
++};
++typedef struct usdr_dms_rx_block usdr_dms_rx_block_t;
++
++int usdr_dms_acquire(pusdr_dms_t stream, unsigned timeout_ms, usdr_dms_rx_block_t *block);
++int usdr_dms_release(pusdr_dms_t stream, const usdr_dms_rx_block_t *block);
++
+ struct usdr_dms_send_stat {
+     dm_time_t lhwtime;
+     dm_time_t opkttime;
+diff --git a/src/utests/rfic/CMakeLists.txt b/src/utests/rfic/CMakeLists.txt
+new file mode 100644
+index 0000000..edfa590
+--- /dev/null
++++ b/src/utests/rfic/CMakeLists.txt
+@@ -0,0 +1,42 @@
++cmake_minimum_required(VERSION 3.16)
++project(usdr_rfic_tests C)
++enable_testing()
++get_filename_component(USDR_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
++find_package(Python3 REQUIRED COMPONENTS Interpreter)
++if(NOT REGISTER_HEADER_DIR)
++    set(REGISTER_HEADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
++    file(MAKE_DIRECTORY "${REGISTER_HEADER_DIR}")
++    execute_process(COMMAND "${Python3_EXECUTABLE}" "${USDR_SRC}/hwparser/gen_h.py"
++        --yaml "${USDR_SRC}/lib/hw/lms6002d/lms6002d.yaml"
++        OUTPUT_FILE "${REGISTER_HEADER_DIR}/def_lms6002d.h"
++        RESULT_VARIABLE GEN_RESULT)
++    if(NOT GEN_RESULT EQUAL 0)
++        message(FATAL_ERROR "Register generation failed; Python needs PyYAML")
++    endif()
++endif()
++add_executable(lms6002d_test lms6002d_test.c "${USDR_SRC}/lib/port/usdr_logging.c")
++target_include_directories(lms6002d_test PRIVATE "${USDR_SRC}/lib/port"
++    "${USDR_SRC}/lib/lowlevel" "${REGISTER_HEADER_DIR}")
++target_compile_options(lms6002d_test PRIVATE -Wall -Wextra -UNDEBUG)
++add_test(NAME lms6002d_register_sequences COMMAND lms6002d_test)
++if(USDR_LIBRARY)
++    add_executable(usdr_ctrl_test usdr_ctrl_test.c)
++    target_include_directories(usdr_ctrl_test PRIVATE "${USDR_SRC}/lib/port" "${USDR_SRC}/lib/lowlevel")
++    target_compile_options(usdr_ctrl_test PRIVATE -Wall -Wextra -UNDEBUG)
++    target_link_libraries(usdr_ctrl_test PRIVATE "${USDR_LIBRARY}")
++    add_test(NAME usdr_auxiliary_tuning COMMAND usdr_ctrl_test)
++    add_executable(stream_borrow_test stream_borrow_test.c)
++    target_include_directories(stream_borrow_test PRIVATE "${USDR_SRC}/lib/port" "${USDR_SRC}/lib/lowlevel")
++    target_compile_options(stream_borrow_test PRIVATE -Wall -Wextra -UNDEBUG)
++    get_filename_component(USDR_LIBRARY_DIR "${USDR_LIBRARY}" DIRECTORY)
++    find_library(USDR_DSP_LIBRARY NAMES usdr-dsp HINTS "${USDR_LIBRARY_DIR}/xdsp" "${USDR_LIBRARY_DIR}" REQUIRED)
++    target_link_libraries(stream_borrow_test PRIVATE "${USDR_LIBRARY}" "${USDR_DSP_LIBRARY}")
++    add_test(NAME native_dma_leases COMMAND stream_borrow_test)
++    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
++        add_executable(pcie_dma_test pcie_dma_test.c)
++        target_include_directories(pcie_dma_test PRIVATE "${USDR_SRC}/lib/port" "${USDR_SRC}/lib/lowlevel")
++        target_compile_options(pcie_dma_test PRIVATE -Wall -Wextra -UNDEBUG)
++        target_link_libraries(pcie_dma_test PRIVATE "${USDR_LIBRARY}")
++        add_test(NAME pcie_dma_transport COMMAND pcie_dma_test)
++    endif()
++endif()
+diff --git a/src/utests/rfic/lms6002d_test.c b/src/utests/rfic/lms6002d_test.c
+new file mode 100644
+index 0000000..d608c63
+--- /dev/null
++++ b/src/utests/rfic/lms6002d_test.c
+@@ -0,0 +1,180 @@
++// SPDX-License-Identifier: MIT
++// Register-model tests of the actual driver, including its internal cal engine.
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include "../../lib/hw/lms6002d/lms6002d.c"
++
++static uint8_t regfile[128];
++static unsigned calls, fail_call, loads[128], starts[128], result_reads;
++static int fail_read_addr, busy, result1, result2, pll_bad;
++static unsigned gain_at_start[5], mode_at_start[5];
++
++static int mock_spi(lldev_t dev, subdev_t sub, unsigned op, lsopaddr_t bus,
++                    size_t nin, void* in, size_t nout, const void* out)
++{
++    (void)dev; (void)sub; (void)bus;
++    assert(op == USDR_LSOP_SPI && nout == 4);
++    unsigned word = *(const uint32_t*)out;
++    unsigned addr = (word >> 8) & 127;
++    ++calls;
++    if (calls == fail_call)
++        return -EIO;
++    if (nin) {
++        if ((int)addr == fail_read_addr) {
++            fail_read_addr = -1;
++            return -EIO;
++        }
++        unsigned value = regfile[addr];
++        if (addr == 0 || addr == 0x30 || addr == 0x50 || addr == 0x60)
++            value = result_reads++ ? result2 : result1;
++        if (addr == 1 || addr == 0x31 || addr == 0x51 || addr == 0x61)
++            value = 0x20 | (busy ? 2 : 0); // RC=1, DC engine done unless forced busy
++        if (addr == 0x1a || addr == 0x2a) {
++            unsigned cap = regfile[addr - 1] & 63;
++            value = pll_bad ? 0x40 : cap < 20 ? 0x80 : cap > 40 ? 0x40 : 0;
++        }
++        *(uint32_t*)in = value;
++    } else {
++        assert(word & 0x8000);
++        // Calibration result registers are read-only.
++        assert(addr != 0 && addr != 0x30 && addr != 0x50 && addr != 0x60);
++        regfile[addr] = word;
++        if (addr == 3 || addr == 0x33 || addr == 0x53 || addr == 0x63) {
++            if (word & 16)
++                ++loads[addr];
++            if (word & 32) {
++                ++starts[addr];
++                assert(loads[addr] == starts[addr]);
++                if (addr == 3) {
++                    assert((regfile[9] & 0x20) && !(regfile[0x0b] & 2));
++                } else if (addr == 0x33 || addr == 0x53) {
++                    assert(!(regfile[(addr & 0xf0) + 15] & 128));
++                    assert(regfile[9] & (addr == 0x33 ? 2 : 8));
++                } else {
++                    assert(!(regfile[0x6e] & 0xc0) && (regfile[9] & 0x10));
++                    unsigned channel = word & 7;
++                    assert(channel < 5);
++                    gain_at_start[channel] = regfile[0x68];
++                    mode_at_start[channel] = regfile[0x64];
++                }
++            }
++        }
++    }
++    return 0;
++}
++
++static lowlevel_ops_t ops = {.ls_op = mock_spi};
++static struct lowlevel_dev device = {.ops = &ops};
++lowlevel_ops_t* lowlevel_get_ops(lldev_t dev) { return dev->ops; }
++
++static lms6002d_state_t state;
++static void reset(void)
++{
++    memset(&state, 0, sizeof(state));
++    memset(regfile, 0, sizeof(regfile));
++    memset(loads, 0, sizeof(loads));
++    memset(starts, 0, sizeof(starts));
++    calls = fail_call = result_reads = 0;
++    fail_read_addr = -1; busy = pll_bad = 0; result1 = result2 = 40;
++    state.dev = &device; state.fref = 40000000;
++    regfile[9] = 5; regfile[0x0b] = 0x0a;
++    regfile[0x3f] = regfile[0x5f] = 0xd5;
++    regfile[0x64] = 0x36; regfile[0x65] = 4; regfile[0x68] = 0x23;
++    regfile[0x6e] = 0xc0; regfile[0x71] = regfile[0x72] = 0x80;
++    regfile[0x7c] = 0x1b;
++}
++
++int main(void)
++{
++    uint8_t value = 99;
++    reset(); regfile[0x5f] &= ~128; regfile[9] |= 8;
++    assert(lms6002d_calibration_loop(&state, 0x50, 0, &value) == 0 && value == 40);
++    assert(regfile[0x52] == 31 && loads[0x53] == 1);
++    reset(); regfile[0x5f] &= ~128; regfile[9] |= 8;
++    result1 = 31; result2 = 0; value = 99;
++    assert(lms6002d_calibration_loop(&state, 0x50, 0, &value) == -EIO && value == 99);
++    assert(regfile[0x52] == 0 && loads[0x53] == 2);
++    reset(); regfile[0x5f] &= ~128; regfile[9] |= 8;
++    result1 = result2 = 31;
++    assert(lms6002d_calibration_loop(&state, 0x50, 0, &value) == 0 && value == 31);
++    reset(); regfile[0x5f] &= ~128; regfile[9] |= 8; busy = 1;
++    assert(lms6002d_calibration_loop(&state, 0x50, 0, &value) == -ETIMEDOUT);
++
++    reset(); fail_read_addr = 0;
++    assert(lms6002d_cal_lpf(&state) == -EIO);
++    assert(regfile[9] == 5 && regfile[0x0b] == 0x0a);
++    reset(); regfile[0x35] = regfile[0x55] = 0xc0;
++    assert(lms6002d_cal_lpf(&state) == 0);
++    assert(regfile[0x35] == 0xe8 && regfile[0x55] == 0xe8);
++    assert(regfile[9] == 5 && regfile[0x0b] == 0x0a);
++    for (unsigned tx = 0; tx < 2; ++tx) {
++        reset();
++        assert(lms6002d_cal_txrxlpfdc(&state, tx) == 0);
++        assert(regfile[9] == 5 && regfile[0x3f] == 0xd5 && regfile[0x5f] == 0xd5);
++        reset(); fail_read_addr = tx ? 0x30 : 0x50;
++        assert(lms6002d_cal_txrxlpfdc(&state, tx) == -EIO);
++        assert(regfile[9] == 5 && regfile[0x3f] == 0xd5 && regfile[0x5f] == 0xd5);
++    }
++    reset();
++    assert(lms6002d_cal_vga2(&state) == 0);
++    assert(!(mode_at_start[0] & 1));
++    for (unsigned ch = 1; ch < 5; ++ch) {
++        assert(mode_at_start[ch] == 0x37);
++        assert(gain_at_start[ch] == (ch < 3 ? 0x06 : 0x60));
++    }
++    assert(regfile[0x64] == 0x36 && regfile[0x65] == 4 && regfile[0x68] == 0x23);
++    assert(regfile[0x6e] == 0xc0 && regfile[9] == 5);
++    reset(); fail_read_addr = 0x60;
++    assert(lms6002d_cal_vga2(&state) == -EIO);
++    assert(regfile[0x64] == 0x36 && regfile[0x68] == 0x23 && regfile[0x6e] == 0xc0);
++
++    reset();
++    assert(lms6002d_rxvga2_enable(&state, true) == 0 && regfile[0x64] == 0x37);
++    assert(lms6002d_set_rxfedc(&state, -1, -63) == 0);
++    assert(regfile[0x71] == 0xc1 && regfile[0x72] == 0xff);
++    assert(lms6002d_set_rx_extterm(&state, true) == 0);
++    assert(regfile[0x71] == 0x41 && regfile[0x7c] == 0x1f);
++    assert(lms6002d_set_rx_extterm(&state, false) == 0);
++    assert(regfile[0x71] == 0xc1 && regfile[0x7c] == 0x1b);
++    regfile[0x73] = 0x80;
++    assert(lms6002d_set_rxfe_ip2corr(&state, -63, -1) == 0);
++    assert(regfile[0x73] == 0xff && regfile[0x74] == 0x41);
++    unsigned before = calls;
++    assert(lms6002d_set_rxfedc(&state, -64, 0) == -ERANGE && calls == before);
++
++    reset(); regfile[6] = 0x0b; regfile[7] = 3; fail_read_addr = 1;
++    assert(lms6002d_cal_lpf_bandwidth(&state, 6, false) == -EIO);
++    assert(!(state.rclpfcal[6] & 0x80));
++    assert(regfile[6] == 0x0b && regfile[7] == 3 && regfile[9] == 5);
++    reset();
++    assert(lms6002d_cal_lpf_bandwidth(&state, 6, false) == 0 && state.rclpfcal[6] == 0x81);
++    regfile[0x55] = 0xe8; regfile[0x56] = 0x8b;
++    assert(lms6002d_set_bandwidth(&state, false, 7000000) == 0);
++    assert(regfile[0x55] == 0xa8 && regfile[0x56] == 0x9b);
++    assert(state.rx_bandwidth == 7000000);
++    assert(lms6002d_set_bandwidth(&state, false, 64000000) == 0);
++    assert(regfile[0x55] == 0xe8 && state.rx_bandwidth == 0);
++
++    reset(); pll_bad = 1;
++    assert(lms6002d_tune_pll(&state, false, 506000000) == -ENOLCK);
++    lms6002_pll_stat_t cached = {.vco_cap_min=20, .vco_cap_max=40, .vco_num=4, .vco_div=2};
++    assert(lms6002d_tune_pll_stat(&state, false, 506000000, false, &cached) == -ENOLCK);
++    assert(regfile[0x2b] & 8);
++    pll_bad = 0;
++    assert(lms6002d_tune_pll_stat(&state, false, 506000000, false, &cached) == 0);
++    assert((regfile[0x29] & 63) == 30 && (regfile[0x2b] & 8));
++    assert(lms6002d_tune_pll(&state, false, 506000000) == 0);
++    assert((regfile[0x29] & 63) >= 20 && (regfile[0x29] & 63) <= 40);
++    state.fref = 0;
++    assert(lms6002d_tune_pll(&state, false, 506000000) == -ERANGE);
++
++    // Every one-shot SPI failure must be observable, including cleanup writes.
++    reset(); assert(lms6002d_cal_vga2(&state) == 0); unsigned total = calls;
++    for (unsigned n = 1; n <= total; ++n) {
++        reset(); fail_call = n;
++        assert(lms6002d_cal_vga2(&state) == -EIO);
++    }
++    puts("PASS: DC load/retry/timeout, field preservation, LPF/VGA2 sequencing, PLL and SPI failures");
++    return 0;
++}
+diff --git a/src/utests/rfic/pcie_dma_test.c b/src/utests/rfic/pcie_dma_test.c
+new file mode 100644
+index 0000000..a32f5e5
+--- /dev/null
++++ b/src/utests/rfic/pcie_dma_test.c
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier: MIT
++// Compile the real Linux transport against a modeled ioctl boundary.
++#include <assert.h>
++#include <stdarg.h>
++#include <sys/ioctl.h>
++static int model_ioctl(int fd, unsigned long request, ...);
++#define ioctl model_ioctl
++#include "../../lib/lowlevel/pcie_uram/pcie_uram_main.c"
++#undef ioctl
++
++static unsigned ioctl_calls, wait_calls, release_calls, result_count=2;
++static int injected_errno, bad_oob;
++static int model_ioctl(int fd, unsigned long request, ...)
++{
++    (void)fd; ++ioctl_calls;
++    if (injected_errno) {errno=injected_errno;injected_errno=0;return -1;}
++    va_list args; va_start(args,request);
++    if (request==PCIE_DRIVER_DMA_WAIT_OOB) {
++        struct pcie_driver_woa_oob *o=va_arg(args,void*);++wait_calls;
++        uint64_t *data=o->oobdata;
++        for (unsigned i=0;i<result_count;++i){data[2*i]=100+i;data[2*i+1]=200+i;}
++        o->ooblength=16*result_count-(bad_oob ? 1 : 0);
++        va_end(args);return result_count;
++    }
++    va_end(args);
++    if (request==PCIE_DRIVER_DMA_RELEASE) {++release_calls;return 0;}
++    assert(0);return -1;
++}
++int main(void)
++{
++    struct pcie_uram_dev d={0};
++    d.ll.ops=&s_pcie_uram_ops;
++    uint32_t regs[1024]={0},samples[2][16];void *areas[]={samples[0],samples[1]};
++    d.mmaped_io=regs;
++    d.scache[0].mmaped_area=areas;d.scache[0].cfg_totbuf=2;d.scache[0].cfg_bufsize=sizeof(samples[0]);
++    void *p=(void*)1,*q=NULL;uint64_t oob[2]={0};unsigned size=16;
++    assert(pcie_uram_recv_dma_wait(&d.ll,0,DBMAX_SRX+DBMAX_STX,&p,oob,&size,1)==-EINVAL);
++    assert(pcie_uram_recv_dma_release(&d.ll,0,DBMAX_SRX+DBMAX_STX,p)==-EINVAL);
++    assert(pcie_uram_recv_dma_wait(&d.ll,0,0,NULL,oob,&size,1)==-EINVAL);
++    size=8;assert(pcie_uram_recv_dma_wait(&d.ll,0,0,&p,oob,&size,1)==-EINVAL);
++    assert(ioctl_calls==0);size=16;
++    injected_errno=ETIMEDOUT;
++    assert(pcie_uram_recv_dma_wait(&d.ll,0,0,&p,oob,&size,1)==-ETIMEDOUT && p==NULL);
++    assert(!d.scache[0].rx_outstanding && !d.scache[0].bufavail);size=16;
++    assert(pcie_uram_recv_dma_wait(&d.ll,0,0,&p,oob,&size,1)==1);
++    assert(p==areas[0] && oob[0]==100 && oob[1]==200 && size==16);
++    size=16;assert(pcie_uram_recv_dma_wait(&d.ll,0,0,&q,oob,&size,1)==0);
++    assert(q==areas[1] && oob[0]==101 && wait_calls==1);
++    void *extra=(void*)1;size=16;
++    assert(pcie_uram_recv_dma_wait(&d.ll,0,0,&extra,oob,&size,1)==-EBUSY && extra==NULL);
++    assert(pcie_uram_recv_dma_release(&d.ll,0,0,q)==-EINVAL && release_calls==0);
++    injected_errno=EAGAIN;
++    assert(pcie_uram_recv_dma_release(&d.ll,0,0,p)==-EAGAIN && d.scache[0].rx_outstanding==2);
++    assert(pcie_uram_recv_dma_release(&d.ll,0,0,p)==0);
++    assert(pcie_uram_recv_dma_release(&d.ll,0,0,p)==-EINVAL);
++    assert(pcie_uram_recv_dma_release(&d.ll,0,0,q)==0 && release_calls==2);
++    bad_oob=1;size=16;
++    assert(pcie_uram_recv_dma_wait(&d.ll,0,0,&p,oob,&size,1)==-EIO && !p);
++    assert(!d.scache[0].rx_outstanding && !d.scache[0].bufavail);
++    puts("PASS PCIe transport bounds, cached OOB, timeout, FIFO ownership and failed-release retry");
++    return 0;
++}
+diff --git a/src/utests/rfic/stream_borrow_test.c b/src/utests/rfic/stream_borrow_test.c
+new file mode 100644
+index 0000000..9c45a3a
+--- /dev/null
++++ b/src/utests/rfic/stream_borrow_test.c
+@@ -0,0 +1,89 @@
++// SPDX-License-Identifier: MIT
++// Real stream implementation with a DMA transport model; no sample-copy stub
++// is involved in acquire/release. Copy receive uses the same metadata path.
++#include "../../lib/ipblks/streams/stream_sfetrx4_dma32.c"
++
++static uint32_t samples[16];
++static unsigned waits, releases, copies, lost, overflow;
++static int wait_error, release_error;
++static int bus_op(lldev_t d, subdev_t s, unsigned op, lsopaddr_t addr,
++                  size_t nin, void *in, size_t nout, const void *out)
++{
++    (void)d; (void)s; (void)nout; (void)out;
++    assert(op == USDR_LSOP_HWREG);
++    if (nin) *(uint32_t*)in = addr == 20 ? overflow : 0;
++    return 0;
++}
++static int wait_dma(lldev_t d, subdev_t s, stream_t ch, void **out,
++                    void *oob, unsigned *size, unsigned timeout)
++{
++    (void)d; (void)s; (void)ch; (void)timeout;
++    ++waits;
++    if (wait_error) return wait_error;
++    assert(*size >= 16);
++    *(uint64_t*)oob = (0x80000000ull << 32) | lost;
++    ((uint64_t*)oob)[1] = 0;
++    *size = 16; *out = samples;
++    return 0;
++}
++static int release_dma(lldev_t d, subdev_t s, stream_t ch, void *p)
++{
++    (void)d; (void)s; (void)ch;
++    assert(p == samples);
++    if (release_error) { release_error = 0; return -EIO; }
++    ++releases;
++    return 0;
++}
++static int get_name(lldev_t d, int op, const char **out)
++{ (void)d; (void)op; *out = "DMA model"; return 0; }
++static void copy_samples(const void *restrict *restrict in, unsigned inbytes, void *restrict *restrict out, unsigned outbytes)
++{ assert(inbytes == 64 && outbytes == 64); ++copies; memcpy(*out,*in,64); }
++
++int main(void)
++{
++    lowlevel_ops_t ops = {.ls_op=bus_op, .recv_dma_wait=wait_dma,
++                         .recv_dma_release=release_dma, .generic_get=get_name};
++    lowlevel_dev_t ll = {.ops=&ops};
++    device_t dev = {.dev=&ll};
++    stream_sfetrx_dma32_t stream = {0};
++    stream.base.dev=&dev; stream.base.ops=&s_sfetr4_dma32_ops;
++    stream.type=USDR_ZCPY_RX; stream.native_ci16=true; stream.channels=1;
++    stream.pkt_bytes=stream.host_bytes=64; stream.pkt_symbs=16;
++    stream.burst_mask=0x80000000; stream.tf_data=copy_samples;
++    stream.overflow_reg=20;
++    pusdr_dms_t handle=(pusdr_dms_t)&stream;
++    usdr_dms_rx_block_t block, stale, invalid;
++    for (unsigned i=0;i<16;++i) samples[i]=i+0x12340000;
++    assert(usdr_dms_acquire(handle,10,&block)==0);
++    assert(block.data==samples && block.bytes==64 && block.samples==16 && copies==0);
++    assert(block.timestamp==0 && block.lost_samples==0 && block.flags==0);
++    stale=block;
++    assert(usdr_dms_acquire(handle,10,&invalid)==-EBUSY && waits==1);
++    assert(_sfetrx4_op(&stream.base,USDR_DMS_STOP,0)==-EBUSY);
++    assert(_sfetrx4_destroy(&stream.base)==-EBUSY);
++    invalid=block; ++invalid.token;
++    assert(usdr_dms_release(handle,&invalid)==-EINVAL && releases==0);
++    release_error=1;
++    assert(usdr_dms_release(handle,&block)==-EIO && stream.leased==samples);
++    assert(usdr_dms_release(handle,&block)==0 && releases==1);
++    assert(usdr_dms_release(handle,&block)==-EINVAL);
++    lost=2;
++    assert(usdr_dms_acquire(handle,10,&block)==0);
++    assert(block.timestamp==48 && block.lost_samples==32 && block.flags==USDR_DMS_BLOCK_DISCONTINUITY);
++    assert(usdr_dms_release(handle,&stale)==-EINVAL);
++    assert(usdr_dms_release(handle,&block)==0);
++    uint32_t copied[16]; void *dest=copied; usdr_dms_recv_nfo_t nfo={0};
++    lost=0;
++    assert(usdr_dms_recv(handle,&dest,10,&nfo)==0 && copies==1);
++    assert(memcmp(copied,samples,64)==0 && nfo.fsymtime==64 && nfo.totlost==32);
++    wait_error=-ETIMEDOUT;
++    assert(usdr_dms_acquire(handle,10,&block)==-ETIMEDOUT && !block.data);
++    wait_error=0; stream.native_ci16=false;
++    unsigned previous=waits;
++    assert(usdr_dms_acquire(handle,10,&block)==-EOPNOTSUPP && waits==previous);
++    stream.native_ci16=true; overflow=1;
++    assert(usdr_dms_acquire(handle,10,&block)==-EOVERFLOW && !block.data && !stream.leased);
++    assert(usdr_dms_acquire(handle,10,&block)==-EOVERFLOW);
++    puts("PASS: native DMA leases, copy compatibility, metadata, timeout, stale release and overflow");
++    return 0;
++}
+diff --git a/src/utests/rfic/usdr_ctrl_test.c b/src/utests/rfic/usdr_ctrl_test.c
+new file mode 100644
+index 0000000..13fce02
+--- /dev/null
++++ b/src/utests/rfic/usdr_ctrl_test.c
+@@ -0,0 +1,156 @@
++// SPDX-License-Identifier: MIT
++// Exercise real driver/clock/RFIC code through a modeled SPI/I2C/control bus.
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include "../../lib/device/m2_lm6_1/usdr_ctrl.h"
++
++static uint8_t regs[128];
++static unsigned phy_writes, calls, fail_at;
++static unsigned measurement_generation, read_address, measure_failure;
++static int dc_decode(unsigned x) { return (x & 64) ? -(int)(x & 63) : (int)(x & 63); }
++static int bus_op(lldev_t dev, subdev_t sub, unsigned op, lsopaddr_t addr,
++                  size_t nin, void* in, size_t nout, const void* out)
++{
++    (void)dev; (void)sub;
++    if (++calls == fail_at) return -EIO;
++    if (op == USDR_LSOP_SPI) {
++        assert(nout == 4);
++        unsigned w = *(const uint32_t*)out, r = (w >> 8) & 127;
++        if (nin) {
++            unsigned v = regs[r];
++            if (r == 0 || r == 0x30 || r == 0x50 || r == 0x60) v = 40;
++            if (r == 1 || r == 0x31 || r == 0x51 || r == 0x61) v = 0x20;
++            if (r == 0x1a || r == 0x2a) {
++                unsigned c = regs[r - 1] & 63;
++                v = c < 20 ? 0x80 : c > 40 ? 0x40 : 0;
++            }
++            *(uint32_t*)in = v;
++        } else regs[r] = w;
++    } else if (op == USDR_LSOP_I2C_DEV) {
++        if (nin) { memset(in, 0, nin); *(uint8_t*)in = 2; }
++    } else if (op == USDR_LSOP_HWREG) {
++        if (nout && (addr == 56 || addr == 57)) ++phy_writes;
++        if (nin) memset(in, 0, nin);
++        if (addr == 56) {
++            if (nout) {
++                unsigned w = *(const uint32_t*)out;
++                if (w >> 31) read_address = (w >> 16) & 255;
++                else if (w == 0x06000000) ++measurement_generation;
++            }
++            if (nin) {
++                if (measure_failure) { measure_failure = 0; return -EIO; }
++                int32_t v = 0;
++                if (read_address == 0) v = measurement_generation;
++                if (read_address == 4) v = (dc_decode(regs[0x71]) + 17) * 64 * 65536;
++                if (read_address == 5) v = (dc_decode(regs[0x72]) - 29) * 64 * 65536;
++                *(int32_t*)in = v;
++            }
++        }
++    } else return -EOPNOTSUPP;
++    return 0;
++}
++static int get_name(lldev_t dev, int op, const char** out)
++{
++    (void)dev; (void)op; *out = "test"; return 0;
++}
++static lowlevel_ops_t ops = {.ls_op = bus_op, .generic_get = get_name};
++static lowlevel_dev_t dev = {.ops = &ops};
++
++int main(void)
++{
++    usdr_dev_t d;
++    assert(usdr_ctor(&dev, 0, &d) == 0);
++    d.fref = d.lms.fref = 26000000;
++    d.lms.dev = &dev; d.hw_board_rev = USDR_REV_3; d.hw_board_hasmixer = true;
++    d.si_vco_div = 8; d.rxbb_decim = d.txbb_intr = 1;
++    d.rx_pwren = true; d.mexir_en = true; d.rx_cfg_path = 0;
++    d.rx_rfic_lna = RXPATH_LNA3; d.rx_lo = 202000000;
++    d.cfg_auto_rx[0] = (freq_auto_band_map_t){.stop_freq=230000000,.band=RXPATH_LNA3,.sw=3,.name0="LNAL",.name1="EXT"};
++    d.cfg_auto_rx[1] = (freq_auto_band_map_t){.stop_freq=2800000000u,.band=RXPATH_LNA1,.sw=0,.name0="LNAW",.name1="W"};
++    d.cfg_auto_rx[2] = (freq_auto_band_map_t){.stop_freq=4000000000u,.band=RXPATH_LNA2,.sw=1,.name0="LNAH",.name1="H"};
++    assert(usdr_set_samplerate_ex(&d,64000000,64000000,0,0,0) == 0);
++    assert(d.adc_clk == 64000000 && d.rawsamplerate == 128000000);
++    assert(d.mixer_lo == 304000000 && d.rfic_rx_lo == 506000000);
++    assert(phy_writes == 0);
++    assert(usdr_set_lob_freq(&d,256000000) == 0);
++    assert(d.si_vco_div == 10 && d.adc_clk == 64000000 && d.mixer_lo == 243200000);
++    assert(d.rfic_rx_lo == 445200000);
++
++    usdr_dev_t before = d;
++    fail_at = calls + 1;
++    assert(usdr_set_lob_freq(&d,304000000) == -EIO);
++    assert(memcmp(&before,&d,sizeof(d)) == 0);
++    fail_at = 0;
++    assert(usdr_set_samplerate_ex(&d,128000000,128000000,0,0,0) == -EINVAL);
++    assert(usdr_rfic_fe_set_rxlna(&d,"typo",false) == -EINVAL);
++    d.rx_lo = 300000000;
++    assert(usdr_rfic_fe_set_rxlna(&d,"W",false) == 0);
++    assert(!d.mexir_en && d.rfic_rx_lo == 300000000);
++    assert(usdr_rfic_fe_set_rxlna(&d,"EXT",false) == 0);
++    assert(d.mexir_en && d.rfic_rx_lo == 543200000);
++    int actual_gain;
++    regs[0x64] = 1; // Independent VGA2A/B gain mode.
++    assert(usdr_rfic_set_gain(&d,GAIN_RX_AUTO,0,NULL) == 0);
++    assert((regs[0x75] >> 6) == 2); // No unsupported LNA3 bypass.
++    assert(usdr_rfic_get_rx_gain(&d,&actual_gain) == 0 && actual_gain == 0);
++    assert(usdr_rfic_set_gain(&d,GAIN_RX_AUTO,50,NULL) == 0);
++    assert((regs[0x75] >> 6) == 3);
++    assert(usdr_rfic_get_rx_gain(&d,&actual_gain) == 0 && actual_gain == 50);
++    before = d; fail_at = calls + 2;
++    assert(usdr_rfic_set_gain(&d,GAIN_RX_AUTO,10,NULL) == -EIO);
++    assert(memcmp(&before,&d,sizeof(d)) == 0); fail_at = 0;
++    assert(usdr_rx_iqimb_set(&d,32768,0) == -ERANGE);
++    assert(usdr_rx_iqimb_set(&d,0,IMB_PHASE_MAX+1) == -ERANGE);
++    fail_at = calls + 2;
++    assert(usdr_rx_iqimb_set(&d,500,500) == -EIO);
++    assert(memcmp(&before,&d,sizeof(d)) == 0); fail_at = 0;
++    assert(usdr_tx_iqimb_set(&d,0,0) == -EOPNOTSUPP);
++    assert(usdr_set_extref(&d,true,40000000) == 0);
++    assert(d.lms.fref == 40000000 && d.adc_clk == 64000000);
++    unsigned bw;
++    assert(usdr_rfic_bb_set_badwidth(&d,false,7000000,&bw) == 0 && bw == 7000000);
++    assert(usdr_rfic_bb_set_badwidth(&d,false,0,&bw) == 0 && bw == 0);
++    assert(usdr_set_rxdccorr(&d,true) == -EOPNOTSUPP);
++    assert(usdr_set_rxdccorr(&d,false) == 0);
++    regs[0x71] = 0x80; regs[0x72] = 0x80; regs[0x7c] = 0x1b;
++    d.lms.rfe_in1sel_dci = 0x80;
++    int result[8];
++    assert(usdr_calibrate(&d,0,USDR_CAL_RXLO,result) == 0);
++    assert(result[0] == -17 && result[1] == 29);
++    assert(dc_decode(regs[0x71]) == -17 && dc_decode(regs[0x72]) == 29);
++    assert((regs[0x71] & 0x80) && (regs[0x72] & 0x80) && regs[0x7c] == 0x1b);
++    assert(d.rx_corr.dc_i == -17 && d.rx_corr.dc_q == 29);
++    uint64_t mean = ~0ull;
++    assert(usdr_rxdccorr(&d,&mean) == 0 && mean == 0);
++    uint8_t old_regs[128]; memcpy(old_regs,regs,sizeof(regs));
++    measure_failure = 1;
++    assert(usdr_calibrate(&d,0,USDR_CAL_RXLO,result) == -EIO);
++    assert(regs[0x71] == old_regs[0x71] && regs[0x72] == old_regs[0x72] && regs[0x7c] == old_regs[0x7c]);
++    d.tx_run = true;
++    assert(usdr_calibrate(&d,0,USDR_CAL_RXLO,result) == -EBUSY);
++    d.tx_run = false;
++    assert(usdr_calibrate(&d,0,USDR_CAL_TXIQIMB,result) == -EOPNOTSUPP);
++    d.rx_run = true;
++    fail_at = calls + 1;
++    assert(usdr_rfic_streaming_down(&d,RFIC_LMS6_RX) == -EIO);
++    assert(d.rx_run && d.rx_pwren);
++    fail_at = 0;
++    assert(usdr_rfic_streaming_down(&d,RFIC_LMS6_RX) == 0);
++    assert(!d.rx_run && !d.rx_pwren);
++    fail_at = calls + 1;
++    assert(usdr_rfic_streaming_up(&d,RFIC_LMS6_RX) == -EIO);
++    assert(!d.rx_run && !d.rx_pwren);
++    fail_at = 0;
++    assert(usdr_rfic_streaming_up(&d,RFIC_LMS6_RX) == 0);
++    assert(d.rx_run && d.rx_pwren);
++    assert(usdr_rfic_streaming_down(&d,RFIC_LMS6_RX) == 0);
++    fail_at = calls + 3; // Front end enabled, then the VGA2 access fails.
++    assert(usdr_rfic_streaming_up(&d,RFIC_LMS6_RX) == -EIO);
++    assert(!d.rx_run && !d.rx_pwren && (regs[5] & 4));
++    fail_at = 0;
++    assert(usdr_rfic_streaming_down(&d,RFIC_LMS6_RX) == 0);
++    assert(!(regs[5] & 4));
++    puts("PASS: auxiliary translation, LO rounding, sample-rate preservation, errors and reference switching");
++    return 0;
++}
