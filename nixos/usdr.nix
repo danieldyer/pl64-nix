@@ -7,9 +7,10 @@ let
 in
 {
   # Deploy together with the validated matching FPGA image; no flashing service.
+  environment.etc."usdr/firmware".source = usdr.firmware;
   boot.extraModulePackages = [ usdr.kernelModule ];
   boot.kernelModules = [ "usdr_pcie_uram" ];
   environment.systemPackages = [ usdr.library usdr.probe pkgs.vulkan-tools ];
-  # Headless Intel Vulkan compute for the DVB-T pipeline; no display manager.
+  # Intel graphics for Vulkan compute and the local SDR++ kiosk.
   hardware.graphics.enable = true;
 }

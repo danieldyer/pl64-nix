@@ -1,0 +1,31 @@
+{
+  "file": "usdr-rev3-operational-c53414a7.bin",
+  "sha256": "1eae21ca8a03a3640db8ce7e14796b53e2bae99a3bb5c7178b40bf5a575061e7",
+  "bytes": 1624388,
+  "board": "uSDR rev3",
+  "part": "xc7a35tcpg236-2",
+  "fpga_id": "0362d093",
+  "tested_hardware_id": "802f0300",
+  "firmware_id": "c53414a7",
+  "role": "operational",
+  "flash_offset": "0x1c0000",
+  "rounded_write_bytes": 1638400,
+  "rtl_revision": "04a3c7812b13b55a1e7c356fae45deb111fec815",
+  "build_flow_revision": "a2e830c",
+  "tool": "Vivado ML Standard 2025.2",
+  "driver_revision": "49c3d57288826dfd1e97e9ec5638df18285fcdfe",
+  "tested_golden_firmware_id": "14302173",
+  "validation": {
+    "configuration_crc": "pass",
+    "full_flash_readback": "exact match",
+    "golden_partition": "unchanged",
+    "physical_power_cycle": "pass",
+    "pcie": "Gen2 x2",
+    "short_receive_tests": "8, 61.44 and 64 MS/s; no loss or timeouts",
+    "analog_dc_startup_and_repeat": "pass with no RF input; live-signal startup failure remains open",
+    "date": "2026-10-24",
+    "rf_characterization": "107 MHz X3 injected-tone checks passed at 8, 32 and 64 MS/s; full characterization pending",
+    "sdrpp_validation": "native PCIe reception, frequency display, controls and HDMI audio passed; short 8, 61.44 and 64 MS/s runs"
+  },
+  "provenance_note": "Exact binary flashed and booted on the PL64. The clean a2e830c rebuild differs only in timestamp and CRC; this file is the tested c53414a7 binary."
+}

@@ -1,0 +1,790 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5e3163ae..5963d4af 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -36,6 +36,7 @@ option(OPT_BUILD_SOAPY_SOURCE "Build SoapySDR Source Module (Dependencies: soapy
+ option(OPT_BUILD_SPECTRAN_SOURCE "Build Spectran Source Module (Dependencies: Aaronia RTSA Suite)" OFF)
+ option(OPT_BUILD_SPECTRAN_HTTP_SOURCE "Build Spectran HTTP Source Module (no dependencies required)" ON)
+ option(OPT_BUILD_SPYSERVER_SOURCE "Build SpyServer Source Module (no dependencies required)" ON)
++option(OPT_BUILD_USDR_SOURCE "Build native uSDR PCIe Source Module (libusdr with DMA borrowing API)" OFF)
+ option(OPT_BUILD_USRP_SOURCE "Build USRP Source Module (libuhd)" OFF)
+ 
+ # Sinks
+@@ -236,6 +237,10 @@ if (OPT_BUILD_SPYSERVER_SOURCE)
+ add_subdirectory("source_modules/spyserver_source")
+ endif (OPT_BUILD_SPYSERVER_SOURCE)
+ 
++if (OPT_BUILD_USDR_SOURCE)
++add_subdirectory("source_modules/usdr_source")
++endif()
++
+ if (OPT_BUILD_USRP_SOURCE)
+ add_subdirectory("source_modules/usrp_source")
+ endif (OPT_BUILD_USRP_SOURCE)
+diff --git a/core/src/core.cpp b/core/src/core.cpp
+index 2b6a89d6..19eabd79 100644
+--- a/core/src/core.cpp
++++ b/core/src/core.cpp
+@@ -209,6 +209,7 @@ int sdrpp_main(int argc, char* argv[]) {
+     defConfig["moduleInstances"]["Spectran HTTP Source"]["enabled"] = true;
+     defConfig["moduleInstances"]["SpyServer Source"]["module"] = "spyserver_source";
+     defConfig["moduleInstances"]["SpyServer Source"]["enabled"] = true;
++    defConfig["moduleInstances"]["uSDR Source"] = {{"module", "usdr_source"}, {"enabled", true}};
+     defConfig["moduleInstances"]["USRP Source"]["module"] = "usrp_source";
+     defConfig["moduleInstances"]["USRP Source"]["enabled"] = true;
+ 
+diff --git a/source_modules/usdr_source/CMakeLists.txt b/source_modules/usdr_source/CMakeLists.txt
+new file mode 100644
+index 00000000..088829e0
+--- /dev/null
++++ b/source_modules/usdr_source/CMakeLists.txt
+@@ -0,0 +1,12 @@
++cmake_minimum_required(VERSION 3.13)
++project(usdr_source)
++find_package(PkgConfig REQUIRED)
++pkg_check_modules(USDR REQUIRED IMPORTED_TARGET usdr)
++set(SRC src/main.cpp src/receiver.cpp)
++include(${SDRPP_MODULE_CMAKE})
++target_link_libraries(usdr_source PRIVATE PkgConfig::USDR)
++option(OPT_TEST_USDR_SOURCE "Test native uSDR DMA ownership and conversion" OFF)
++if(OPT_TEST_USDR_SOURCE)
++    enable_testing()
++    add_subdirectory(tests)
++endif()
+diff --git a/source_modules/usdr_source/README.md b/source_modules/usdr_source/README.md
+new file mode 100644
+index 00000000..93f57923
+--- /dev/null
++++ b/source_modules/usdr_source/README.md
+@@ -0,0 +1,84 @@
++# Native uSDR PCIe source
++
++Build with `-DOPT_BUILD_USDR_SOURCE=ON` and a libusdr providing
++`usdr_dms_acquire` / `usdr_dms_release` plus applied-setting readback. The PL64
++package pins the reviewed driver revision `49c3d57288826dfd1e97e9ec5638df18285fcdfe`.
++This source targets the single-channel uSDR rev3 PCIe receive configuration.
++It does not create a transmit stream or modify flash.
++
++Select **uSDR** in the Source menu. A fresh SDR++ configuration creates its module
++instance automatically; for an existing profile, add an instance of `usdr_source`
++in Module Manager if needed. Devices are discovered as `/dev/usdrN` without opening
++them; Refresh devices repeats that scan. The device opens only on Play.
++
++Controls:
++
++- Receive path: EXT (auxiliary HF/VHF connector X3), W, H, or automatic.
++- Sample rate: presets from 1 to 65 MS/s including 61.44 and 64 MS/s, or an integer
++  custom rate in that range. The driver's applied rate is passed to SDR++.
++- Baseband filter: all 16 nominal RF bandwidths from 1.5 to 28 MHz. Filter bypass
++  remains outside this source's controls pending the separate RF experiments.
++- Gain: manual relative gain, requested as 0–85 dB. The driver distributes this
++  across LNA/VGA stages and may clamp or quantize it; the applied value is shown.
++  The underlying `/gain/auto` API means stage allocation, not an AGC loop.
++- Normal SDR++ frequency tuning is supported while receiving, as is gain adjustment.
++  Device/path/rate/filter changes require Stop, then Play; startup reruns the
++  driver's analog DC calibration.
++
++The panel displays applied rate, bandwidth, path, frequency and gain, and receive
++loss/discontinuity/timeout counters. Settings persist in `usdr_config.json` in the
++SDR++ profile. A read failure closes the receiver and displays an error; use Stop
++then Play to retry. There is no background digital DC subtraction in this source.
++
++## Buffer ownership
++
++```
++uSDR PCIe DMA (CI16, borrowed) -> VOLK conversion -> SDR++ CF32 write buffer
++                              release DMA       -> swap SDR++ buffers
++```
++
++The native DMA block is read directly, with no intermediate CI16 allocation or
++copy. One vectorized pass converts and scales I,Q by 1/32768 directly into
++SDR++'s existing float buffer. The DMA lease is released before `swap()` can block
++on downstream DSP. Every libusdr access is serialized against the lease, including
++live frequency/gain updates. Displayed status uses a separate short-lived lock,
++so a DMA wait cannot stall GUI repainting; pending controls take precedence over
++the next DMA read. A 100 ms acquire timeout bounds normal stopping;
++20 consecutive no-data returns stop the worker with a visible error. Stop unblocks
++a downstream-stalled producer before joining it and closing the device.
++
++SDR++'s float DSP requires that conversion/output write; this is not an end-to-end
++zero-copy float pipeline. Downstream SDR++ DSP has its own buffering. The native
++packet size is 16,384 complex samples (64 KiB CI16); no per-packet heap allocation
++is introduced by this source.
++
++## Local checks and pending target validation
++
++On 24 October 2026, the backend tests passed on macOS arm64 with the existing
++AppleClang 21 and VOLK 3.3, both normally and with AddressSanitizer and
++UndefinedBehaviorSanitizer. They use a fake libusdr API and cover exact conversion,
++coerced-setting readback, lease lifetime, timestamp gaps, timeouts, invalid blocks,
++partial startup failure, failed release/retry, repeated open/close, concurrent
++controls, and stopping against a blocked SDR++ consumer. The plugin translation
++unit also passes a syntax check against the real SDR++ and libusdr headers.
++
++Run without installing libusdr, from the SDR++ checkout (adjust its sibling path):
++
++```sh
++cmake -S source_modules/usdr_source/tests -B build/usdr-tests \
++  -DUSDR_SOURCE_DIR="$(cd ../usdr-lib && pwd)" -DCMAKE_BUILD_TYPE=Debug
++cmake --build build/usdr-tests -j4
++ctest --test-dir build/usdr-tests --output-on-failure
++```
++
++The command passes an absolute `USDR_SOURCE_DIR` to avoid build-directory-relative paths.
++The Nix package enables the same tests with `OPT_TEST_USDR_SOURCE=ON`.
++
++The Ubuntu builder and PL64 were offline during initial implementation. Those
++local checks did not qualify the Linux package/system, kiosk display/audio or
++actual receive throughput. Subsequent PL64 deployment results are recorded in
++`pl64-nix/README.md`. The earlier native CI16 driver probes are not a measure
++of this float DSP pipeline. Once available, test repeated Play/Stop, live tuning
++and gain, each path, and 8/61.44/64 MS/s with loss counters visible. A 64 MS/s
++sample clock does not imply a 64 MHz analog passband; physical X3 response and
++RF performance remain for the planned radio tests.
+diff --git a/source_modules/usdr_source/src/main.cpp b/source_modules/usdr_source/src/main.cpp
+new file mode 100644
+index 00000000..eca3ea9a
+--- /dev/null
++++ b/source_modules/usdr_source/src/main.cpp
+@@ -0,0 +1,216 @@
++#include "receiver.h"
++#include <module.h>
++#include <core.h>
++#include <config.h>
++#include <gui/smgui.h>
++#include <signal_path/signal_path.h>
++#include <utils/flog.h>
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstdio>
++#include <filesystem>
++#include <thread>
++
++SDRPP_MOD_INFO{
++    "usdr_source", "Native uSDR PCIe receive source", "SDR++ contributors", 0, 1, 0, 1
++};
++static ConfigManager config;
++namespace {
++const unsigned rates[] = {1000000, 2000000, 4000000, 8000000, 10000000, 16000000,
++    20000000, 24000000, 30000000, 32000000, 40000000, 50000000, 61440000, 64000000, 65000000};
++const char rateLabels[] = "1 MS/s\0" "2 MS/s\0" "4 MS/s\0" "8 MS/s\0" "10 MS/s\0" "16 MS/s\0"
++    "20 MS/s\0" "24 MS/s\0" "30 MS/s\0" "32 MS/s\0" "40 MS/s\0" "50 MS/s\0"
++    "61.44 MS/s\0" "64 MS/s\0" "65 MS/s\0" "Custom\0";
++const unsigned bandwidths[] = {1500000, 1750000, 2500000, 2750000, 3000000, 3840000,
++    5000000, 5500000, 6000000, 7000000, 8750000, 10000000, 12000000, 14000000, 20000000, 28000000};
++const char bandwidthLabels[] = "1.5 MHz\0" "1.75 MHz\0" "2.5 MHz\0" "2.75 MHz\0" "3 MHz\0" "3.84 MHz\0"
++    "5 MHz\0" "5.5 MHz\0" "6 MHz\0" "7 MHz\0" "8.75 MHz\0" "10 MHz\0" "12 MHz\0" "14 MHz\0" "20 MHz\0" "28 MHz\0";
++const char* paths[] = {"EXT", "W", "H", "auto"};
++const char pathLabels[] = "EXT - auxiliary HF/VHF (X3)\0W - wideband\0H - high band\0Automatic\0";
++template<size_t N> int indexOf(const unsigned (&values)[N], unsigned value) {
++    return static_cast<int>(std::find(values, values + N, value) - values);
++}
++}
++class USDRSourceModule : public ModuleManager::Instance {
++public:
++    explicit USDRSourceModule(std::string name) : name(std::move(name)) {
++        config.acquire();
++        try {
++            settings.device = config.conf.value("device", settings.device);
++            settings.rate = std::clamp(config.conf.value("sampleRate", settings.rate), 1000000u, 65000000u);
++            settings.bandwidth = config.conf.value("bandwidth", settings.bandwidth);
++            settings.path = config.conf.value("path", settings.path);
++            settings.gain = std::min(config.conf.value("gain", settings.gain), 85u);
++        } catch (const std::exception&) { settings = {}; }
++        config.release();
++        rateId = indexOf(rates, settings.rate);
++        bandwidthId = indexOf(bandwidths, settings.bandwidth);
++        if (bandwidthId == 16) { bandwidthId = 9; settings.bandwidth = bandwidths[9]; }
++        for (int i = 0; i < 4; ++i) if (settings.path == paths[i]) pathId = i;
++        settings.path = paths[pathId];
++        customRate = settings.rate;
++        gain = settings.gain;
++        refresh();
++        handler.ctx = this;
++        handler.stream = &output;
++        handler.selectHandler = [](void* p) { auto& s = *static_cast<USDRSourceModule*>(p); core::setInputSampleRate(s.settings.rate); };
++        handler.deselectHandler = [](void*) {};
++        handler.menuHandler = [](void* p) { static_cast<USDRSourceModule*>(p)->menu(); };
++        handler.startHandler = [](void* p) { static_cast<USDRSourceModule*>(p)->start(); };
++        handler.stopHandler = [](void* p) { static_cast<USDRSourceModule*>(p)->stop(); };
++        handler.tuneHandler = [](double f, void* p) { static_cast<USDRSourceModule*>(p)->tune(f); };
++        sigpath::sourceManager.registerSource("uSDR", &handler);
++    }
++    ~USDRSourceModule() { stop(); sigpath::sourceManager.unregisterSource("uSDR"); }
++    void postInit() override {}
++    void enable() override { enabled = true; }
++    void disable() override { stop(); enabled = false; }
++    bool isEnabled() override { return enabled; }
++private:
++    const char* label(const char* text) { widgetLabel = std::string(text) + "##" + name; return widgetLabel.c_str(); }
++    void report(const std::string& text) {
++        std::lock_guard<std::mutex> lock(errorMutex);
++        error = text;
++        if (!text.empty()) flog::error("uSDR: {0}", text);
++    }
++    void save() {
++        config.acquire();
++        config.conf["device"] = settings.device;
++        config.conf["sampleRate"] = settings.rate;
++        config.conf["bandwidth"] = settings.bandwidth;
++        config.conf["path"] = settings.path;
++        config.conf["gain"] = settings.gain;
++        config.release(true);
++    }
++    void refresh() {
++        devices.clear(); deviceLabels.clear(); deviceId = -1;
++        std::error_code ec;
++        for (const auto& entry : std::filesystem::directory_iterator("/dev", ec)) {
++            const std::string dev = entry.path().filename().string();
++            if (dev.compare(0, 4, "usdr") == 0 && dev.size() > 4 &&
++                dev.find_first_not_of("0123456789", 4) == std::string::npos) devices.push_back(dev);
++        }
++        std::sort(devices.begin(), devices.end());
++        for (size_t i = 0; i < devices.size(); ++i) {
++            if (devices[i] == settings.device) deviceId = static_cast<int>(i);
++            deviceLabels += devices[i]; deviceLabels += '\0';
++        }
++        if (deviceId < 0 && !devices.empty()) { deviceId = 0; settings.device = devices[0]; }
++    }
++    void start() {
++        if (running || !enabled) return;
++        report("");
++        try {
++            receiver.open(settings);
++            const auto applied = receiver.status();
++            core::setInputSampleRate(applied.rate);
++            receiver.start();
++            quit = false;
++            running = true;
++            worker = std::thread([this] {
++                try {
++                    unsigned consecutiveTimeouts = 0;
++                    while (!quit) {
++                        static_assert(sizeof(dsp::complex_t) == 2 * sizeof(float), "SDR++ IQ layout");
++                        const unsigned count = receiver.read(reinterpret_cast<float*>(output.writeBuf), STREAM_BUFFER_SIZE);
++                        if (quit) break;
++                        if (!count) {
++                            if (++consecutiveTimeouts >= 20) throw std::runtime_error("No receive data for two seconds; stop and restart the source");
++                            continue;
++                        }
++                        consecutiveTimeouts = 0;
++                        // The native DMA lease has already been returned, before swap can block.
++                        if (!output.swap(count)) break;
++                    }
++                } catch (const std::exception& e) { report(e.what()); }
++                if (receiver.close() < 0) report("uSDR receive shutdown failed; check the device before restarting");
++            });
++        } catch (const std::exception& e) {
++            receiver.close(); running = false; report(e.what());
++        }
++    }
++    void stop() {
++        quit = true;
++        output.stopWriter();
++        if (worker.joinable()) worker.join();
++        receiver.close();
++        output.clearWriteStop();
++        running = false;
++    }
++    void tune(double frequency) {
++        // Source selection initially sends zero before the saved center frequency.
++        if (!running && frequency == 0.0) return;
++        if (!std::isfinite(frequency) || frequency < 1 || frequency > 3800000000.0) { report("Receive frequency is out of range"); return; }
++        const auto value = static_cast<uint64_t>(std::llround(frequency));
++        try {
++            if (running) receiver.tune(value);
++            settings.frequency = value;
++        } catch (const std::exception& e) { report(e.what()); }
++    }
++    void menu() {
++        if (running) SmGui::BeginDisabled();
++        SmGui::FillWidth(); SmGui::ForceSync();
++        if (SmGui::Combo(label("Device"), &deviceId, deviceLabels.c_str()) && deviceId >= 0 && deviceId < static_cast<int>(devices.size())) { settings.device = devices[deviceId]; save(); }
++        if (SmGui::Button(label("Refresh devices"))) refresh();
++        SmGui::FillWidth(); SmGui::ForceSync();
++        if (SmGui::Combo(label("Receive path"), &pathId, pathLabels)) { pathId = std::clamp(pathId, 0, 3); settings.path = paths[pathId]; save(); }
++        SmGui::FillWidth(); SmGui::ForceSync();
++        if (SmGui::Combo(label("Sample rate"), &rateId, rateLabels)) {
++            rateId = std::clamp(rateId, 0, 15);
++            settings.rate = rateId < 15 ? rates[rateId] : customRate;
++            core::setInputSampleRate(settings.rate); save();
++        }
++        if (rateId == 15) {
++            SmGui::FillWidth(); SmGui::ForceSync();
++            if (SmGui::InputInt(label("Rate (Hz)"), &customRate, 100000, 1000000)) {
++                customRate = std::clamp(customRate, 1000000, 65000000);
++                settings.rate = customRate; core::setInputSampleRate(settings.rate); save();
++            }
++        }
++        SmGui::FillWidth(); SmGui::ForceSync();
++        if (SmGui::Combo(label("Baseband bandwidth"), &bandwidthId, bandwidthLabels)) { bandwidthId = std::clamp(bandwidthId, 0, 15); settings.bandwidth = bandwidths[bandwidthId]; save(); }
++        if (running) SmGui::EndDisabled();
++        SmGui::Text("Stop reception to change path, rate or filter.");
++        SmGui::FillWidth(); SmGui::ForceSync();
++        if (SmGui::SliderInt(label("Gain"), &gain, 0, 85, SmGui::FMT_STR_INT_DB)) {
++            gain = std::clamp(gain, 0, 85);
++            try {
++                if (running) receiver.setGain(gain);
++                settings.gain = gain; save();
++            } catch (const std::exception& e) { gain = settings.gain; report(e.what()); }
++        }
++        SmGui::Text("Manual relative gain (LNA/VGA allocation).");
++        if (running) {
++            const auto s = receiver.status();
++            char text[256];
++            std::snprintf(text, sizeof(text), "Applied: %.6f MS/s, %.3f MHz filter\n%s, %.6f MHz, %u dB gain",
++                s.rate / 1e6, s.bandwidth / 1e6, s.path.c_str(), s.frequency / 1e6, s.gain);
++            SmGui::Text(text);
++            std::snprintf(text, sizeof(text), "Lost: %llu   Gaps: %llu   Timeouts: %llu",
++                static_cast<unsigned long long>(s.lost), static_cast<unsigned long long>(s.discontinuities), static_cast<unsigned long long>(s.timeouts));
++            SmGui::Text(text);
++        }
++        std::lock_guard<std::mutex> lock(errorMutex);
++        if (!error.empty()) SmGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), error.c_str());
++    }
++    std::string name, widgetLabel, deviceLabels, error;
++    std::vector<std::string> devices;
++    std::mutex errorMutex;
++    native_usdr::Settings settings;
++    native_usdr::Receiver receiver;
++    SourceManager::SourceHandler handler{};
++    dsp::stream<dsp::complex_t> output;
++    std::thread worker;
++    std::atomic<bool> quit{true};
++    bool enabled = true, running = false;
++    int deviceId = -1, pathId = 0, rateId = 3, bandwidthId = 9, customRate = 8000000, gain = 30;
++};
++MOD_EXPORT void _INIT_() {
++    config.setPath(core::args["root"].s() + "/usdr_config.json");
++    config.load(json::object());
++    config.enableAutoSave();
++}
++MOD_EXPORT ModuleManager::Instance* _CREATE_INSTANCE_(std::string name) { return new USDRSourceModule(std::move(name)); }
++MOD_EXPORT void _DELETE_INSTANCE_(ModuleManager::Instance* instance) { delete instance; }
++MOD_EXPORT void _END_() { config.disableAutoSave(); config.save(); }
+diff --git a/source_modules/usdr_source/src/receiver.cpp b/source_modules/usdr_source/src/receiver.cpp
+new file mode 100644
+index 00000000..5dd9ea44
+--- /dev/null
++++ b/source_modules/usdr_source/src/receiver.cpp
+@@ -0,0 +1,163 @@
++#include "receiver.h"
++#include <volk/volk.h>
++#include <cerrno>
++#include <cstring>
++#include <stdexcept>
++#include <algorithm>
++
++namespace native_usdr {
++namespace {
++void check(int result, const char* operation) {
++    if (result < 0) throw std::runtime_error(std::string(operation) + ": " + std::strerror(-result));
++}
++void validate(const Settings& s) {
++    // Restrict this source to the reviewed single-channel rev3 PCIe receive path.
++    if (s.device.compare(0, 4, "usdr") || s.device.size() == 4 ||
++        s.device.find_first_not_of("0123456789", 4) != std::string::npos ||
++        (s.path != "EXT" && s.path != "W" && s.path != "H" && s.path != "auto") ||
++        s.rate < 1000000 || s.rate > 65000000 || !s.frequency || s.frequency > 3800000000ULL ||
++        s.bandwidth < 1500000 || s.bandwidth > 28000000 || s.gain > 85)
++        throw std::runtime_error("Invalid uSDR receive settings");
++}
++}
++Receiver::~Receiver() { close(); }
++void Receiver::set(const char* path, uint64_t value) { check(usdr_dme_set_uint(device, path, value), path); }
++uint64_t Receiver::get(const char* path) {
++    uint64_t value = 0;
++    check(usdr_dme_get_uint(device, path, &value), path);
++    return value;
++}
++void Receiver::readApplied() {
++    applied.rate = get("/dm/rate/master");
++    applied.bandwidth = get("/dm/sdr/0/rx/bandwidth");
++    applied.gain = get("/dm/sdr/0/rx/gain/auto");
++    applied.frequency = get("/dm/sdr/0/rx/frequency");
++    const char* path = nullptr;
++    check(usdr_dme_get_string(device, "/dm/sdr/0/rx/path", &path), "Read receive path");
++    if (!path || !applied.rate) throw std::runtime_error("Invalid uSDR applied settings");
++    applied.path = path;
++    publishStatus();
++}
++void Receiver::open(const Settings& s) {
++    std::lock_guard<std::mutex> gate(controlGate);
++    std::lock_guard<std::mutex> lock(mutex);
++    validate(s);
++    if (device) throw std::runtime_error("uSDR is already open");
++    applied = {};
++    publishStatus();
++    haveTimestamp = false;
++    try {
++        check(usdr_dmd_create_string(("bus=pcie,dev=" + s.device).c_str(), &device), "Open uSDR");
++        set("/dm/power/en", 1);
++        set("/dm/rate/master", s.rate);
++        check(usdr_dme_set_string(device, "/dm/sdr/0/rx/path", s.path.c_str()), "Set receive path");
++        set("/dm/sdr/0/rx/frequency", s.frequency);
++        set("/dm/sdr/0/rx/bandwidth", s.bandwidth);
++        set("/dm/sdr/0/rx/gain/auto", s.gain);
++        // Creation performs the driver's analog receive calibration, before DMA starts.
++        check(usdr_dms_create(device, "/ll/srx/0", "ci16", 1, blockSamples, &stream), "Create native RX stream");
++        readApplied();
++        check(usdr_dms_sync(device, "off", 1, &stream), "Prepare RX stream");
++    } catch (...) {
++        closeLocked();
++        throw;
++    }
++}
++void Receiver::start() {
++    std::lock_guard<std::mutex> gate(controlGate);
++    std::lock_guard<std::mutex> lock(mutex);
++    if (!stream || started) throw std::runtime_error("uSDR stream is not ready to start");
++    // Even a partially failed START must be stopped during cleanup.
++    started = true;
++    try {
++        check(usdr_dms_op(stream, USDR_DMS_START, 0), "Start RX");
++        check(usdr_dms_sync(device, "none", 1, &stream), "Release RX synchronization");
++    } catch (...) {
++        closeLocked();
++        throw;
++    }
++}
++int Receiver::closeLocked() noexcept {
++    int result = 0;
++    if (leased) {
++        // Retry a failed release with its original token before tearing down.
++        result = usdr_dms_release(stream, &lease);
++        if (!result) leased = false;
++    }
++    if (stream && !leased) {
++        if (started) result = usdr_dms_op(stream, USDR_DMS_STOP, 0);
++        const int destroyed = usdr_dms_destroy(stream);
++        if (!result) result = destroyed;
++    }
++    // If the device has failed, closing its fd is the final DMA shutdown path.
++    if (device) {
++        const int closed = usdr_dmd_close(device);
++        if (!result) result = closed;
++    }
++    device = nullptr;
++    stream = nullptr;
++    started = false;
++    leased = false;
++    return result;
++}
++int Receiver::close() noexcept {
++    std::lock_guard<std::mutex> gate(controlGate);
++    std::lock_guard<std::mutex> lock(mutex);
++    return closeLocked();
++}
++unsigned Receiver::read(float* output, unsigned capacity) {
++    std::unique_lock<std::mutex> gate(controlGate);
++    std::lock_guard<std::mutex> lock(mutex);
++    gate.unlock();
++    if (!started || !output) throw std::runtime_error("uSDR receiver is not running");
++    if (leased) throw std::runtime_error("uSDR DMA release failed; close the receiver before restarting");
++    auto& block = lease;
++    const int result = usdr_dms_acquire(stream, 100, &block);
++    if (result == -ETIMEDOUT || result == -EAGAIN) { ++applied.timeouts; publishStatus(); return 0; }
++    check(result, "Borrow RX DMA buffer");
++    leased = true;
++    // Always release, including malformed blocks. Never hand a DMA pointer to SDR++.
++    const bool valid = block.data && block.format == USDR_DMS_NATIVE_CI16_LE &&
++        block.samples && block.samples <= capacity && block.samples <= blockSamples &&
++        block.bytes == static_cast<size_t>(block.samples) * 4;
++    if (valid) {
++        volk_16i_s32f_convert_32f(output, static_cast<const int16_t*>(block.data), 32768.0f, block.samples * 2);
++    }
++    check(usdr_dms_release(stream, &block), "Release RX DMA buffer");
++    leased = false;
++    if (!valid) throw std::runtime_error("Unexpected uSDR native DMA format or size");
++    if ((block.flags & USDR_DMS_BLOCK_DISCONTINUITY) ||
++        (haveTimestamp && block.timestamp != expectedTimestamp)) ++applied.discontinuities;
++    expectedTimestamp = block.timestamp + block.samples;
++    haveTimestamp = true;
++    applied.samples += block.samples;
++    applied.lost += block.lost_samples;
++    publishStatus();
++    return block.samples;
++}
++void Receiver::tune(uint64_t frequency) {
++    std::lock_guard<std::mutex> gate(controlGate);
++    std::lock_guard<std::mutex> lock(mutex);
++    if (!device) throw std::runtime_error("uSDR receiver is closed");
++    if (!frequency || frequency > 3800000000ULL) throw std::runtime_error("Invalid receive frequency");
++    set("/dm/sdr/0/rx/frequency", frequency);
++    readApplied(); // Automatic path selection can change with frequency.
++}
++void Receiver::setGain(unsigned gain) {
++    std::lock_guard<std::mutex> gate(controlGate);
++    std::lock_guard<std::mutex> lock(mutex);
++    if (!device) throw std::runtime_error("uSDR receiver is closed");
++    if (gain > 85) throw std::runtime_error("Invalid receive gain");
++    set("/dm/sdr/0/rx/gain/auto", gain);
++    applied.gain = get("/dm/sdr/0/rx/gain/auto");
++    publishStatus();
++}
++void Receiver::publishStatus() {
++    std::lock_guard<std::mutex> lock(statusMutex);
++    published = applied;
++}
++Status Receiver::status() {
++    std::lock_guard<std::mutex> lock(statusMutex);
++    return published;
++}
++}
+diff --git a/source_modules/usdr_source/src/receiver.h b/source_modules/usdr_source/src/receiver.h
+new file mode 100644
+index 00000000..4c49400c
+--- /dev/null
++++ b/source_modules/usdr_source/src/receiver.h
+@@ -0,0 +1,56 @@
++#pragma once
++#include <dm_dev.h>
++#include <dm_stream.h>
++#include <cstdint>
++#include <mutex>
++#include <string>
++
++namespace native_usdr {
++constexpr unsigned blockSamples = 16384;
++struct Settings {
++    std::string device = "usdr0";
++    std::string path = "EXT";
++    unsigned rate = 8000000;
++    uint64_t frequency = 202000000;
++    unsigned bandwidth = 7000000;
++    unsigned gain = 30; // Manual relative gain; driver distributes it across stages.
++};
++struct Status {
++    unsigned rate = 0, bandwidth = 0, gain = 0;
++    uint64_t frequency = 0, samples = 0, lost = 0, discontinuities = 0, timeouts = 0;
++    std::string path;
++};
++// Serializes all libusdr operations, including live tuning, against DMA leases.
++// read() writes normalized interleaved I,Q directly into the caller's float buffer.
++// No native buffer survives read(); downstream backpressure never holds a lease.
++class Receiver {
++public:
++    ~Receiver();
++    void open(const Settings& settings);
++    void start();
++    int close() noexcept;
++    unsigned read(float* output, unsigned capacity);
++    void tune(uint64_t frequency);
++    void setGain(unsigned gain);
++    Status status();
++private:
++    int closeLocked() noexcept;
++    void readApplied();
++    void publishStatus();
++    void set(const char* path, uint64_t value);
++    uint64_t get(const char* path);
++    // The reader releases the gate while waiting for DMA. A control request can
++    // hold it while waiting for mutex, preventing the reader from overtaking it.
++    std::mutex controlGate;
++    std::mutex mutex;
++    std::mutex statusMutex;
++    pdm_dev_t device = nullptr;
++    pusdr_dms_t stream = nullptr;
++    bool started = false, haveTimestamp = false;
++    uint64_t expectedTimestamp = 0;
++    usdr_dms_rx_block_t lease{};
++    bool leased = false;
++    Status applied;
++    Status published;
++};
++}
+diff --git a/source_modules/usdr_source/tests/CMakeLists.txt b/source_modules/usdr_source/tests/CMakeLists.txt
+new file mode 100644
+index 00000000..6443bedf
+--- /dev/null
++++ b/source_modules/usdr_source/tests/CMakeLists.txt
+@@ -0,0 +1,18 @@
++cmake_minimum_required(VERSION 3.13)
++project(usdr_source_tests LANGUAGES CXX)
++set(CMAKE_CXX_STANDARD 17)
++find_package(PkgConfig REQUIRED)
++pkg_check_modules(VOLK REQUIRED IMPORTED_TARGET volk)
++# A local header path permits offline tests without installing libusdr.
++if(USDR_SOURCE_DIR)
++    get_filename_component(USDR_SOURCE_DIR "${USDR_SOURCE_DIR}" ABSOLUTE BASE_DIR "${CMAKE_BINARY_DIR}")
++    set(USDR_TEST_INCLUDES "${USDR_SOURCE_DIR}/src/lib/models" "${USDR_SOURCE_DIR}/src/lib/port")
++else()
++    pkg_check_modules(USDR REQUIRED usdr)
++    set(USDR_TEST_INCLUDES ${USDR_INCLUDE_DIRS})
++endif()
++enable_testing()
++add_executable(usdr_receiver_test receiver_test.cpp ../src/receiver.cpp)
++target_include_directories(usdr_receiver_test PRIVATE ${USDR_TEST_INCLUDES} "${CMAKE_CURRENT_SOURCE_DIR}/../../../core/src")
++target_link_libraries(usdr_receiver_test PRIVATE PkgConfig::VOLK)
++add_test(NAME usdr_dma_ownership COMMAND usdr_receiver_test)
+diff --git a/source_modules/usdr_source/tests/receiver_test.cpp b/source_modules/usdr_source/tests/receiver_test.cpp
+new file mode 100644
+index 00000000..74834081
+--- /dev/null
++++ b/source_modules/usdr_source/tests/receiver_test.cpp
+@@ -0,0 +1,164 @@
++#include "../src/receiver.h"
++#include <array>
++#include <iostream>
++#include <map>
++#include <stdexcept>
++#include <vector>
++#include <functional>
++#include <thread>
++#include <atomic>
++#include <chrono>
++#include <dsp/stream.h>
++using native_usdr::Receiver;
++using native_usdr::Settings;
++static void require(bool test) { if (!test) throw std::runtime_error("test assertion failed"); }
++namespace {
++std::map<std::string, uint64_t> values;
++std::string path;
++bool opened = false, created = false, started = false, borrowed = false;
++int acquireError = 0, releaseFailures = 0, startError = 0;
++std::string failSet;
++unsigned invalidBlock = 0, releases = 0, closes = 0, acquireDelay = 0;
++uint64_t timestamp = 0, lost = 0;
++std::atomic<bool> acquiring{false}, holdAcquire{false};
++std::array<int16_t, 8> samples = {-32768, 32767, -16384, 16384, 0, 16, -16, 0};
++void reset() {
++    require(!opened && !created && !started && !borrowed);
++    values.clear(); path.clear(); acquireError = releaseFailures = startError = 0;
++    failSet.clear(); invalidBlock = releases = closes = acquireDelay = 0; timestamp = lost = 0;
++}
++void throws(const std::function<void()>& op) { bool caught = false; try { op(); } catch (const std::runtime_error&) { caught = true; } require(caught); }
++}
++extern "C" {
++int usdr_dmd_create_string(const char* connection, pdm_dev_t* out) {
++    require(std::string(connection) == "bus=pcie,dev=usdr0" && !opened);
++    opened = true; *out = reinterpret_cast<pdm_dev_t>(1); return 0;
++}
++int usdr_dmd_close(pdm_dev_t) {
++    // Simulate final fd shutdown even if a removed device rejects release.
++    opened = created = started = borrowed = false; ++closes; return 0;
++}
++int usdr_dme_set_uint(pdm_dev_t, const char* name, uint64_t value) {
++    require(opened && !borrowed);
++    if (name == failSet) return -EIO;
++    values[name] = value;
++    return 0;
++}
++int usdr_dme_get_uint(pdm_dev_t, const char* name, uint64_t* out) {
++    require(opened && !borrowed);
++    *out = values.at(name);
++    // Applied gain and sample rate intentionally differ from the request.
++    if (std::string(name) == "/dm/sdr/0/rx/gain/auto" && *out) --*out;
++    if (std::string(name) == "/dm/rate/master") *out -= 10;
++    return 0;
++}
++int usdr_dme_set_string(pdm_dev_t, const char*, const char* value) { require(!borrowed); path = value; return 0; }
++int usdr_dme_get_string(pdm_dev_t, const char*, const char** out) { *out = path.c_str(); return 0; }
++int usdr_dms_create(pdm_dev_t, const char* name, const char* format, logical_ch_msk_t channels, unsigned count, pusdr_dms_t* out) {
++    require(std::string(name) == "/ll/srx/0" && std::string(format) == "ci16" && channels == 1 && count == 16384);
++    require(opened && !created); created = true; *out = reinterpret_cast<pusdr_dms_t>(2); return 0;
++}
++int usdr_dms_sync(pdm_dev_t, const char*, unsigned, pusdr_dms_t*) { require(created && !borrowed); return 0; }
++int usdr_dms_op(pusdr_dms_t, unsigned op, dm_time_t) {
++    require(created && !borrowed);
++    if (op == USDR_DMS_START) { started = true; return startError; }
++    require(op == USDR_DMS_STOP); started = false; return 0;
++}
++int usdr_dms_destroy(pusdr_dms_t) { require(created && !borrowed && !started); created = false; return 0; }
++int usdr_dms_acquire(pusdr_dms_t, unsigned timeout, usdr_dms_rx_block_t* out) {
++    require(created && started && !borrowed && timeout == 100);
++    acquiring = true;
++    while (holdAcquire) std::this_thread::yield();
++    if (acquireDelay) std::this_thread::sleep_for(std::chrono::milliseconds(acquireDelay));
++    if (acquireError) return acquireError;
++    borrowed = true;
++    *out = {samples.data(), sizeof(samples), 4, USDR_DMS_NATIVE_CI16_LE, timestamp, lost, 123, 0};
++    if (invalidBlock == 1) out->bytes++;
++    if (invalidBlock == 2) out->format = 99;
++    if (invalidBlock == 3) out->data = nullptr;
++    if (invalidBlock == 4) out->samples = 0;
++    timestamp += 4; return 0;
++}
++int usdr_dms_release(pusdr_dms_t, const usdr_dms_rx_block_t* block) {
++    require(borrowed && block->token == 123);
++    if (releaseFailures) { --releaseFailures; return -EIO; }
++    borrowed = false; ++releases; return 0;
++}
++}
++int main() {
++    try {
++        std::array<float, 8> out{};
++        reset();
++        {
++            Receiver rx; rx.open({});
++            require(rx.status().rate == 7999990 && rx.status().gain == 29 && rx.status().path == "EXT");
++            rx.start();
++            require(rx.read(out.data(), 4) == 4 && releases == 1 && !borrowed);
++            for (size_t i = 0; i < out.size(); ++i) require(out[i] == samples[i] / 32768.0f);
++            // Reusing DMA storage cannot alter the already converted output.
++            auto expected = out; auto saved = samples; samples.fill(1234); require(out == expected); samples = saved;
++            timestamp += 8; lost = 8; rx.read(out.data(), 4);
++            require(rx.status().samples == 8 && rx.status().lost == 8 && rx.status().discontinuities == 1);
++            acquireError = -ETIMEDOUT; require(rx.read(out.data(), 4) == 0 && rx.status().timeouts == 1);
++            acquireError = -EIO; throws([&] { rx.read(out.data(), 4); }); acquireError = 0;
++            rx.tune(600000000); rx.setGain(40);
++            require(rx.status().frequency == 600000000 && rx.status().gain == 39);
++            rx.close(); rx.close(); require(closes == 1);
++            rx.open({}); rx.start(); rx.read(out.data(), 4); require(rx.status().samples == 4); rx.close();
++        }
++        for (unsigned bad = 1; bad <= 5; ++bad) {
++            reset(); Receiver rx; rx.open({}); rx.start(); invalidBlock = bad;
++            throws([&] { rx.read(out.data(), bad == 5 ? 3 : 4); });
++            require(!borrowed && releases == 1); rx.close();
++        }
++        reset(); { Receiver rx; failSet = "/dm/sdr/0/rx/bandwidth"; throws([&] { rx.open({}); }); require(!opened && closes == 1); }
++        reset(); { Receiver rx; rx.open({}); startError = -EIO; throws([&] { rx.start(); }); require(!opened && !started); }
++        reset(); { Receiver rx; rx.open({}); rx.start(); releaseFailures = 1; throws([&] { rx.read(out.data(), 4); }); require(borrowed); require(rx.close() == 0 && !borrowed); }
++        reset(); { Receiver rx; rx.open({}); rx.start(); releaseFailures = 2; throws([&] { rx.read(out.data(), 4); }); require(rx.close() < 0 && !opened); }
++        reset(); { Receiver rx; Settings s; s.device = "usdr0,bus=usb"; throws([&] { rx.open(s); }); require(!opened); }
++        reset(); {
++            Receiver rx; rx.open({}); rx.start(); acquireDelay = 10;
++            std::thread reader([&] { for (int i = 0; i < 10; ++i) rx.read(out.data(), 4); });
++            for (int i = 0; i < 10; ++i) { rx.tune(202000000 + i); rx.setGain(i); }
++            reader.join(); rx.close();
++        }
++        reset(); {
++            Receiver rx; rx.open({}); rx.start();
++            acquiring = false; holdAcquire = true;
++            std::thread reader([&] { rx.read(out.data(), 4); });
++            while (!acquiring) std::this_thread::yield();
++            std::atomic<bool> statusReturned{false};
++            std::thread display([&] { rx.status(); statusReturned = true; });
++            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
++            while (!statusReturned && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
++            const bool independent = statusReturned;
++            holdAcquire = false; reader.join(); display.join(); rx.close();
++            require(independent);
++        }
++        reset(); {
++            Receiver rx; rx.open({}); rx.start();
++            dsp::stream<float> output;
++            std::atomic<unsigned> converted{0};
++            std::thread producer([&] {
++                for (int i = 0; i < 3; ++i) {
++                    const unsigned n = rx.read(output.writeBuf, 4);
++                    ++converted;
++                    if (!output.swap(n * 2)) break;
++                }
++                rx.close();
++            });
++            // Deliberately never consume the first buffer. The second swap blocks,
++            // but its native DMA lease must already have been returned.
++            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
++            while (converted.load() < 2 && std::chrono::steady_clock::now() < deadline)
++                std::this_thread::yield();
++            const bool returned = converted.load() == 2 && !borrowed && releases == 2;
++            const auto before = std::chrono::steady_clock::now();
++            output.stopWriter(); producer.join();
++            require(returned && !opened && std::chrono::steady_clock::now() - before < std::chrono::seconds(1));
++        }
++        reset();
++        std::cout << "PASS: conversion, applied settings, DMA ownership, discontinuities, timeout, failure cleanup, restart, concurrent controls, nonblocking display status, blocked-consumer stop\n";
++        return 0;
++    } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
++}

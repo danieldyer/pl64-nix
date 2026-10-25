@@ -36,6 +36,8 @@
         default = installer.config.system.build.isoImage;
         installer-iso = installer.config.system.build.isoImage;
         system = pl64.config.system.build.toplevel;
+        sdrpp = import ./pkgs/sdrpp { inherit pkgs; usdrLibrary = usdr.library; };
+        usdr-firmware = usdr.firmware;
         usdr-lib = usdr.library;
         usdr-kernel-module = usdr.kernelModule;
         usdr-native-probe = usdr.probe;

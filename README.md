@@ -139,7 +139,9 @@ poweroff
 
 Remove the USB stick and power the PL64 on. The installed system has HDMI text
 consoles, NetworkManager, SSH, local man pages and standard administration,
-network, storage and diagnostic tools. It has no desktop or display manager.
+network, storage and diagnostic tools. The source configuration now adds a single
+fullscreen SDR++ session on tty1; see the SDR++ section below for its validation
+status. It has no desktop environment or display manager.
 Avahi advertises the installed system as `pl64.local` on the local network:
 
 ```sh
@@ -416,7 +418,8 @@ module and native receive probe. `pkgs/usdr` pins a public upstream revision
 and applies the checked-in essential-fix patch; rebuilding does not depend on
 adjacent working trees or unpublished Git commits. The package metadata records
 the driver code revision. The installed system enables headless Intel Vulkan
-support through Mesa and provides `vulkaninfo`; no desktop is enabled.
+support through Mesa and provides `vulkaninfo`; the SDR++ kiosk uses the same
+Intel graphics support without a desktop environment.
 
 Build on the Ubuntu VM after syncing this checkout into a separate directory:
 
@@ -452,3 +455,153 @@ passed at 8, 61.44 and 64 MS/s; full RF qualification is still pending. The
 driver patch includes the rev3 reference-buffer startup order and receive-only,
 repeatable analog DC calibration fixes found during these checks. Detailed
 results are in `usdr-lib/audit/2026-10-22/TARGET_TESTS.txt`.
+
+
+## Fullscreen SDR++ with native uSDR
+
+`nixos/sdrpp.nix` adds a manually started Cage session on tty1. The system boots
+to a text console; `systemctl start cage-tty1` launches SDR++ fullscreen as the
+dedicated `sdr` user, with PipeWire audio and access to the PCIe uSDR. There is no desktop, window-management UI, display manager or SDR++ network
+server. Ctrl+Alt+F2 switches to a text console; Ctrl+Alt+F1 returns to SDR++.
+SSH remains available. The kiosk restarts if the application exits during a
+manually started session. `systemctl stop cage-tty1` ends that session.
+
+Enable **HD Audio** in the PL64 BIOS: disabling it hides the Intel PCI audio
+controller from Linux, including HDMI audio. Nix provides the audio drivers,
+SOF firmware, PipeWire and a preference for the onboard controller's first HDMI
+output (the connector currently used by the local monitor). SDR++ uses the
+system default output. The connected P105FC monitor supports stereo PCM audio.
+
+The initial profile selects uSDR, 202 MHz, EXT/X3, 8 MS/s, 7 MHz filter and 30 dB
+requested relative gain, with a 60 fps waterfall. Start the session manually,
+then press Play to receive. Neither SDR++ nor reception starts at boot.
+Preferences live in `/home/sdr/.config/sdrpp`; each kiosk launch enforces fullscreen while preserving other preferences. The Nix package includes the
+native uSDR source, file playback, audio output, radio demodulators, frequency
+manager and recorder. SoapySDR is disabled.
+
+The native source borrows CI16 PCIe DMA buffers directly and converts them with
+VOLK into SDR++'s CF32 output buffer, without an intermediate sample copy. It
+returns each DMA lease before waiting on SDR++ DSP. This still requires one
+format-conversion write, since SDR++ consumes float IQ. Source controls expose
+EXT/W/H/automatic paths, rate presets/custom rate from 1–65 MS/s, all 16 RFIC
+filter bandwidths from 1.5–28 MHz, and manual gain with applied-value readback.
+Frequency and gain can change live; stop before changing path/rate/filter.
+
+EXT tuning uses antenna frequencies: the driver adds the actual auxiliary mixer
+LO when programming the LMS6002D and removes it from frequency readback. Leave
+SDR++'s manual frequency offset at zero. Clock changes recalculate that LO. For
+example, 202 MHz at 8 MS/s uses a 298 MHz mixer LO and a 500 MHz RFIC LO. A high
+sample rate does not widen the analog filter beyond its 28 MHz maximum setting.
+
+Manage the kiosk from SSH or a text console:
+
+```sh
+systemctl status cage-tty1
+journalctl -b -u cage-tty1
+systemctl stop cage-tty1       # Release uSDR before running another capture tool.
+systemctl start cage-tty1
+```
+
+### Reproducible package changes
+
+Both locally modified packages are pinned upstream sources plus checked-in
+patches. Neither package depends on `/Users/danielrd` paths, a sibling checkout,
+a working tree, or unpublished Git commits at build time:
+
+- `pkgs/usdr/default.nix` pins wavelet-lab/usdr-lib at
+  `f7e869df29582934b87d3759e3c108d60a27e451` and applies `essential-rx.patch`.
+  It builds the library, kernel module and existing native CI16 probe from the
+  matched driver changes at `49c3d57288826dfd1e97e9ec5638df18285fcdfe`.
+- `pkgs/sdrpp/default.nix` pins SDR++ at
+  `f10fb98af8b80de01de94e60c17608e4281e2515` and applies `native-usdr.patch`.
+  The patch exports SDR++ development commit
+  `8e348bc134ea664de57b4c4f11dd99470dfb1595`. It retains Nixpkgs' resource-path
+  handling and links the same patched libusdr.
+- Development is maintained in `usdr-lib` on `dd/essential-rx-fixes` and
+  `sdrplusplus` on `dd/native-usdr`. Export a new patch when making further source
+  changes, and update this configuration together with it. The SDR++ patch is a
+  binary-capable `git diff` from its pinned upstream revision to the development
+  revision; it includes its native-source tests and documentation.
+- `pkgs/usdr/firmware/` carries the exact tested rev3 operational binary
+  `c53414a7`, its checksum and hardware/source manifest. Nix verifies the checksum
+  and exposes it at `/etc/usdr/firmware` on the target. FPGA builds/flashing remain
+  separate: rebuilding NixOS does not flash the SDR. This is an operational image,
+  not a full flash or golden image; confirm the replacement board and flash layout
+  before a deliberate manual update. `nix build .#usdr-firmware` builds just this
+  local firmware package.
+
+Build on the Ubuntu VM using the normal source-sync procedure above:
+
+```sh
+nix build .#sdrpp -L -o result-sdrpp
+nix build .#system -L -o result-system
+```
+
+The package's check phase runs the native receiver ownership/conversion tests.
+Deploy the resulting system closure and copy this configuration to `/etc/nixos`
+using the existing deployment procedure; no manual target-only package setup is
+required. Start the GUI explicitly with `systemctl start cage-tty1`; it is not
+a dependency of the boot or graphical targets.
+
+### Validation status, 24 October 2026
+
+The native Linux package and complete NixOS system built on the Ubuntu VM and
+are deployed on the PL64. The package's receiver tests passed, including DMA
+ownership/conversion, failure cleanup, restart, blocked-consumer handling and
+status polling during a blocked DMA wait. Local ASan/UBSan tests also passed;
+no software was installed on the Mac.
+
+The local HDMI session runs fullscreen at 1920x1280/60 Hz using Intel hardware
+rendering. Non-root reception, repeated Play/Stop, live frequency/gain changes,
+Ctrl+Alt+F2/F1 and kiosk stop/restart passed. Stop released the device descriptor;
+the final kiosk stopped in 0.166 seconds without a timeout. Service startup was
+tested. A subsequent reboot confirmed the manual-only session stays stopped.
+
+Steady reception at 8, 61.44 and 64 MS/s produced approximately 60 GUI and
+waterfall frames per second, with zero displayed lost samples, discontinuities
+or receive timeouts. The 61.44 MS/s run lasted over three minutes, and the final
+64 MS/s run about 45 seconds; an earlier 64 MS/s run lasted nine minutes without
+receive errors. The higher-rate runs used the 28 MHz filter. PCIe AER counters
+remained zero. These are functional checks without an injected RF signal, not
+RF performance measurements or proof of 64 MHz usable analog bandwidth.
+
+An initial GUI stall was traced to status polling sharing the lock held during
+DMA waits. The source now publishes status under a separate short lock and
+prioritizes pending receive controls. Before this fix the GUI fell below 2 fps;
+afterward steady frame intervals were normally about 16.7 ms, with occasional
+33 ms frames. Startup analog calibration can still pause the UI briefly.
+Temporary frame instrumentation and input-injection services were removed.
+
+Enabling HD Audio in BIOS exposed the Intel PCH controller, ALC256 analog codec
+and HDMI outputs. SDR++ now routes to the P105FC HDMI sink; the user confirmed
+audible test beeps through the monitor. The earlier Dummy Output was caused by
+the disabled controller, not missing Nix audio drivers.
+
+A subsequent X3 test with a 107.0 MHz CW generator at a requested -60 dBm
+received the tone at the correct frequency at 8, 32 and 64 MS/s. Disabling
+upconverter LO output or its separate mixer enable pin suppressed it by about
+47 dB at 8 MS/s; restoring either control restored reception. SDR++ also
+shows the tone at 107.000 MHz with zero displayed loss, gaps or timeouts.
+This verifies basic auxiliary frequency conversion and display orientation,
+not calibrated sensitivity, gain, frequency accuracy or linearity.
+
+The same test found that the driver's internal termination setting does not
+isolate LNA3/X3. Its existing DC calibration therefore still needs qualification
+with signals connected; powering down LNA3 removes the tone but changes the DC
+operating point, so no replacement was applied blindly. A subsequent test through
+the user's filter and 20 dB external LNA reproduced startup calibration failures
+with the generator at -60 dBm. Starting with RF off succeeded; enabling the tone
+at -80 dBm afterward gave correct 107 MHz reception and 33 dB peak ADC headroom
+at 15 dB receiver gain. This confirms the signal chain passes the tone, while
+live-signal startup calibration remains faulty. The user subsequently observed
+intermittent reception while mating the antenna connector, then confirmed
+antenna reception working. This points to its connection/termination as the
+immediate reception problem; no further driver or FPGA change was needed for
+that recovery. Other filter/path combinations, spurs and full RF characterization
+remain open. Detailed measurements are in
+`usdr-lib/audit/2026-10-24-fm/NOTES.txt`; earlier driver-level W/H captures are
+in `usdr-lib/audit/2026-10-22/TARGET_TESTS.txt`.
+
+Deployment logs, frame measurements and screenshots are retained locally under
+`artifacts/sdrpp-20261024/` (ignored by Git). The tested FPGA binary and its
+checksum are installed at `/etc/usdr/firmware`; this deployment did not flash it.

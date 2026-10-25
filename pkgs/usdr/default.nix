@@ -17,6 +17,7 @@ let
 in
 {
   inherit source library;
+  firmware = pkgs.callPackage ./firmware.nix {};
   kernelModule = kernelPackages.callPackage ./kernel-module.nix { inherit source revision; };
   probe = pkgs.callPackage ./probe.nix { inherit source library revision; };
 }
