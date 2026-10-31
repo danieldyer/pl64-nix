@@ -605,3 +605,17 @@ in `usdr-lib/audit/2026-10-22/TARGET_TESTS.txt`.
 Deployment logs, frame measurements and screenshots are retained locally under
 `artifacts/sdrpp-20261024/` (ignored by Git). The tested FPGA binary and its
 checksum are installed at `/etc/usdr/firmware`; this deployment did not flash it.
+
+## IMU/GNSS navigation service
+
+The navigation service and synthetic sensor harness live in [`cpp/ins`](cpp/ins/README.md).
+They estimate navigation at the IMU reference point independently of downstream
+radar processing. [`nixos/ins.nix`](nixos/ins.nix) defines the package, sensor
+ownership, raw MCAP logging and Unix-socket state output. `nix build .#pl64-ins`
+builds and tests the application; `.#system` includes its COM1-activated service.
+
+The implementation uses one square-root UKF with bounded delayed-measurement
+replay and a coarse/fine alignment state machine. Sensor simulation is test-only.
+The module README describes local CMake builds, configuration, recording/replay,
+and the state interface. Set the measured GNSS lever arm and mounting rotation
+before using navigation output; the checked-in geometry is provisional.

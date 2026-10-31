@@ -5,6 +5,12 @@ ubx() {
   ubxtool -P 14 -f "$gps_device" -w 0.5 "$@"
 }
 
+# UART1 is unused on this USB receiver. Its default 9600-baud NMEA
+# output saturates shared transmit storage at 10 Hz, dropping USB epochs
+# and configuration replies (MON-TXBUF reports allocation errors). Disable
+# UART1 output in RAM; preserve its 8N1/9600 settings and input protocols.
+ubx -c 06,00,01,00,00,00,c0,08,00,00,80,25,00,00,07,00,00,00,00,00,00,00 >/dev/null
+
 version=$(ubx -p MON-VER -v 2)
 grep -q 'hwVersion 00070000' <<< "$version"
 grep -qE 'PROTVER[ =]+14[.]00' <<< "$version"
@@ -38,4 +44,8 @@ grep -qE 'dynModel 8 fixmode' <<< "$state"
 grep -qE 'staticHoldThresh 0 ' <<< "$state"
 grep -qE 'inProtoMask 0x0*1 outProtoMask 0x0*1' <<< "$state"
 grep -qE 'lpMode 0 ' <<< "$state"
+
+# Verify the unused UART remains muted; do not confuse its mask with USB.
+uart=$(ubx -v 2 -p CFG-PRT,1)
+grep -qE 'inProtoMask 0x0*7 outProtoMask 0x0+( |$)' <<< "$uart"
 printf '%s\n' 'u-blox 7 verified: UBX USB, 10 Hz, airborne <4g, static hold off, continuous tracking.'

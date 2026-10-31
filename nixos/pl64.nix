@@ -1,6 +1,7 @@
 { lib, ... }:
 {
-  imports = [ ./navigation.nix ./usdr.nix ./sdrpp.nix ];
+  imports = [ ./navigation.nix ./ins.nix ./usdr.nix ./sdrpp.nix ];
+  services.pl64-ins.enable = true;
   networking.hostName = "pl64";
   services.avahi = {
     enable = true;

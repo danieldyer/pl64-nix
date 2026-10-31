@@ -1,0 +1,41 @@
+find_package(Eigen3 3.4 REQUIRED NO_MODULE)
+find_package(nlohmann_json 3.11 REQUIRED)
+find_package(FlatBuffers CONFIG REQUIRED)
+find_path(MCAP_INCLUDE_DIR mcap/writer.hpp REQUIRED)
+find_package(Threads REQUIRED)
+
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/navigation_generated.h ${CMAKE_CURRENT_BINARY_DIR}/navigation.bfbs
+  COMMAND flatbuffers::flatc --cpp --scoped-enums -o ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/schema/navigation.fbs
+  COMMAND flatbuffers::flatc -b --schema -o ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/schema/navigation.fbs
+  DEPENDS schema/navigation.fbs VERBATIM)
+add_library(ins
+  src/model.cpp src/ukf.cpp src/alignment.cpp src/estimator.cpp src/protocol.cpp
+  src/clock.cpp src/acquisition.cpp src/recording.cpp src/config.cpp
+  ${CMAKE_CURRENT_BINARY_DIR}/navigation_generated.h)
+add_library(ins::ins ALIAS ins)
+target_compile_features(ins PUBLIC cxx_std_23)
+target_include_directories(ins PUBLIC include PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(ins SYSTEM PRIVATE ${MCAP_INCLUDE_DIR})
+target_link_libraries(ins PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json PRIVATE flatbuffers::flatbuffers Threads::Threads)
+target_compile_definitions(ins PRIVATE MCAP_COMPRESSION_NO_LZ4 MCAP_COMPRESSION_NO_ZSTD)
+target_compile_options(ins PRIVATE -Wall -Wextra -Wpedantic)
+add_executable(pl64-ins src/main.cpp src/live.cpp)
+target_link_libraries(pl64-ins PRIVATE ins Threads::Threads)
+target_compile_definitions(pl64-ins PRIVATE INS_SCHEMA_PATH="${CMAKE_INSTALL_PREFIX}/share/pl64-ins/navigation.bfbs")
+install(TARGETS pl64-ins RUNTIME DESTINATION bin)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/navigation.bfbs schema/navigation.fbs DESTINATION share/pl64-ins)
+if(BUILD_TESTING)
+  add_library(ins-simulation STATIC tests/simulator.cpp)
+  target_link_libraries(ins-simulation PUBLIC ins)
+  target_include_directories(ins-simulation PUBLIC tests)
+  add_executable(ins-tests tests/tests.cpp)
+  target_link_libraries(ins-tests PRIVATE ins-simulation)
+  target_compile_definitions(ins-tests PRIVATE INS_TEST_SCHEMA="${CMAKE_CURRENT_BINARY_DIR}/navigation.bfbs")
+  add_test(NAME ins-validation COMMAND ins-tests)
+  add_executable(ins-navigation-tests tests/navigation.cpp)
+  target_link_libraries(ins-navigation-tests PRIVATE ins-simulation)
+  add_test(NAME ins-navigation COMMAND ins-navigation-tests)
+  set_tests_properties(ins-navigation PROPERTIES TIMEOUT 300)
+  add_executable(ins-capture tests/capture.cpp)
+  target_link_libraries(ins-capture PRIVATE ins)
+endif()

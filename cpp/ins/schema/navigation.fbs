@@ -1,0 +1,34 @@
+namespace pl64.ins.fb;
+
+enum Source:byte { Imu, Gnss, Clock, Estimator, Simulator }
+enum Kind:byte { Raw, Imu, Gnss, State, Health, Metadata, Truth }
+// All monotonic times are ns in the acquisition clock domain. UTC is Unix ns.
+// Measurement time is an estimate, never a replacement for recorded arrival.
+table Record {
+  kind:Kind;
+  source:Source;
+  sequence:ulong;
+  arrival_ns:long;
+  utc_ns:long;
+  measurement_ns:long;
+  timing_sigma_ns:double;
+  native_counter:ulong;
+  payload:[ubyte];
+  // SI units. IMU: omega xyz, specific force xyz. GNSS: lat/lon rad,
+  // ellipsoid height m, velocity NED m/s, position sigma NED, velocity sigma.
+  // State/truth: position in fixed origin NED, velocity, quaternion xyzw,
+  // gyro bias, accel bias. State then appends ECEF origin xyz and a row-major
+  // 3x3 rotation from fixed origin NED to ECEF (28 values when valid).
+  // Covariance: row-major 15x15 in p,v,right body rotation,bg,ba order.
+  values:[double];
+  covariance:[double];
+  flags:uint;
+  detail:string;
+  // State flags: low byte is Stage in declaration order; bit 8 means a
+  // heading uncertainty passing readiness; bit 9 means a reference frame exists.
+  gnss_age_s:double;
+  update_ms:double;
+  normalized_residual:double;
+}
+root_type Record;
+file_identifier "PINS";
