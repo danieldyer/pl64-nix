@@ -18,7 +18,24 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "radar-src": "radar-src"
+      }
+    },
+    "radar-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1793492951,
+        "narHash": "sha256-2Cc0x4vAqMmU0qhQVEkkmtlDcdKcimAe1gqMinR9cEM=",
+        "ref": "main",
+        "rev": "eccc1513dd9dca97de53739dde7f2144ddfb9790",
+        "type": "git",
+        "url": "ssh://git@github.com/danieldyer/dvbt-passive-radar.git"
+      },
+      "original": {
+        "ref": "main",
+        "type": "git",
+        "url": "ssh://git@github.com/danieldyer/dvbt-passive-radar.git"
       }
     }
   },

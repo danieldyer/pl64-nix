@@ -1,0 +1,5 @@
+include(CMakeFindDependencyMacro)
+find_dependency(nlohmann_json 3.11)
+find_dependency(Threads)
+include("${CMAKE_CURRENT_LIST_DIR}/pl64-runtime-targets.cmake")
+set(PL64_RUNTIME_SCHEMA "${CMAKE_CURRENT_LIST_DIR}/../../../share/pl64-runtime/system.fbs")

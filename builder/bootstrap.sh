@@ -28,7 +28,7 @@ if [[ ! -x /nix/var/nix/profiles/default/bin/nix ]]; then
     trap 'rm -f "$installer"' EXIT
     curl --fail --location --proto '=https' --tlsv1.2 \
         https://nixos.org/nix/install -o "$installer"
-    env NIX_INSTALLER_YES=1 bash "$installer" --daemon --no-channel-add
+    sudo -H env NIX_INSTALLER_YES=1 bash "$installer" --daemon --no-channel-add
 fi
 
 install -d -m 0755 /etc/nix

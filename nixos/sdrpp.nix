@@ -23,7 +23,7 @@ let
   });
   kiosk = pkgs.writeShellApplication {
     name = "sdrpp-kiosk";
-    runtimeInputs = [ pkgs.coreutils pkgs.jq ];
+    runtimeInputs = [ pkgs.coreutils pkgs.jq pkgs.util-linux ];
     text = ''
       umask 077
       config_dir="$HOME/.config/sdrpp"
@@ -34,7 +34,7 @@ let
       # Keep user tuning/display preferences, but always launch fullscreen.
       jq '.fullscreen = true' "$config_dir/config.json" > "$config_dir/config.json.new"
       mv -f "$config_dir/config.json.new" "$config_dir/config.json"
-      exec ${sdrpp}/bin/sdrpp --root "$config_dir"
+      exec flock --nonblock /run/lock/pl64-radio.lock ${sdrpp}/bin/sdrpp --root "$config_dir"
     '';
   };
 in
@@ -59,6 +59,7 @@ in
     program = "${kiosk}/bin/sdrpp-kiosk";
     extraArguments = [ "-s" ]; # Allow Ctrl+Alt+Fn to switch to a text console.
     environment.WLR_LIBINPUT_NO_DEVICES = "1";
+    environment.XDG_SESSION_TYPE = "wayland";
   };
   # Keep the fullscreen session available, but start it only on request.
   systemd.defaultUnit = lib.mkForce "multi-user.target";

@@ -37,7 +37,7 @@ nix build .#pl64-ins
 ./result/bin/pl64-ins live --config /path/to/settings.json
 ```
 
-The Nix module is `nixos/ins.nix`. It owns COM1, starts on IMU device activation
+The Nix module is `nixos/ins.nix`. It owns COM2, starts on IMU device activation
 (including boot with the USB serial adapter present), records to
 `/var/lib/pl64-ins`, and publishes at `/run/pl64-ins/state.sock`.
 The known IMU is configured for 200 Hz floating-point output at 460800 baud.

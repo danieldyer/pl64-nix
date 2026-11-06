@@ -139,9 +139,9 @@ poweroff
 
 Remove the USB stick and power the PL64 on. The installed system has HDMI text
 consoles, NetworkManager, SSH, local man pages and standard administration,
-network, storage and diagnostic tools. The source configuration now adds a single
-fullscreen SDR++ session on tty1; see the SDR++ section below for its validation
-status. It has no desktop environment or display manager.
+network, storage and diagnostic tools. The source configuration provides on-demand
+fullscreen SDR++ and radar control sessions on tty1. Neither GUI starts at boot.
+It has no desktop environment or display manager.
 Avahi advertises the installed system as `pl64.local` on the local network:
 
 ```sh
@@ -224,18 +224,21 @@ implicit Nixpkgs source checkout; updates fetch the inputs pinned by
 
 ## IMU serial ports
 
-`nixos/navigation.nix` configures both onboard Fintek serial ports at the
-IMU-1221-R02-232 factory settings: 9600 baud, 8 data bits, no parity, one stop
-bit, raw input/output, no RTS/CTS or XON/XOFF flow control, and no requirement
-for a carrier-detect signal. Settings are applied when each port appears,
-including at boot. Stable aliases are `/dev/pl64com1` and `/dev/pl64com2`.
-The connected IMU is verified on **`/dev/pl64com1`**, at sensor address `0x00`.
-There is no IMU polling daemon or sensor-side configuration in this setup.
+The onboard Fintek serial ports have stable aliases `/dev/pl64com1` and
+`/dev/pl64com2`. The IMU cable moved to **COM2** on 6 November 2026, at sensor
+address `0x00`. `pl64-ins` owns that port and configures the IMU for 200 Hz
+floating-point output at 460800 baud. Its device binding and udev permissions
+follow `services.pl64-ins.settings.service.imu_device`.
+
+`nixos/navigation.nix` applies the factory host format only to unused ports:
+9600 baud, 8 data bits, no parity, one stop bit, raw I/O, no hardware/software
+flow control or carrier-detect requirement. It does not run a competing stty
+service on the port owned by acquisition.
 
 ```sh
 stty -F /dev/pl64com1 -a
 stty -F /dev/pl64com2 -a
-systemctl status pl64-com1-settings pl64-com2-settings
+systemctl status pl64-com1-settings pl64-ins
 ```
 
 The IMU normally waits for a binary query rather than streaming on power-up.
@@ -244,11 +247,12 @@ documents an address query `77 04 00 1f 23` and a combined gyro/accelerometer
 query `77 04 00 59 5d`. These are raw hexadecimal bytes, with no line ending.
 Do not type their hexadecimal spelling into a terminal and expect a reply.
 
-To request one combined gyro/accelerometer sample from the PL64 console:
+For a manual factory-mode query, first stop `pl64-ins` and ensure the sensor
+is in query/response mode at 9600 baud. Do not run this against the live stream:
 
 ```sh
 printf '\x77\x04\x00\x59\x5d' |
-  socat -t 1 -T 1 - /dev/pl64com1,raw,echo=0,b9600,cs8,parenb=0,cstopb=0,crtscts=0,ixon=0,ixoff=0,clocal=1 |
+  socat -t 1 -T 1 - /dev/pl64com2,raw,echo=0,b9600,cs8,parenb=0,cstopb=0,crtscts=0,ixon=0,ixoff=0,clocal=1 |
   od -An -tx1
 ```
 
@@ -463,8 +467,9 @@ results are in `usdr-lib/audit/2026-10-22/TARGET_TESTS.txt`.
 to a text console; `systemctl start cage-tty1` launches SDR++ fullscreen as the
 dedicated `sdr` user, with PipeWire audio and access to the PCIe uSDR. There is no desktop, window-management UI, display manager or SDR++ network
 server. Ctrl+Alt+F2 switches to a text console; Ctrl+Alt+F1 returns to SDR++.
-SSH remains available. The kiosk restarts if the application exits during a
-manually started session. `systemctl stop cage-tty1` ends that session.
+SSH remains available. Exiting either application ends its session and returns
+tty1 to a login prompt. `pl64-sdrpp` launches SDR++; `pl64-gui` launches the
+instrument control GUI. `systemctl stop cage-tty1` also ends the SDR++ session.
 
 Enable **HD Audio** in the PL64 BIOS: disabling it hides the Intel PCI audio
 controller from Linux, including HDMI audio. Nix provides the audio drivers,
@@ -612,10 +617,255 @@ The navigation service and synthetic sensor harness live in [`cpp/ins`](cpp/ins/
 They estimate navigation at the IMU reference point independently of downstream
 radar processing. [`nixos/ins.nix`](nixos/ins.nix) defines the package, sensor
 ownership, raw MCAP logging and Unix-socket state output. `nix build .#pl64-ins`
-builds and tests the application; `.#system` includes its COM1-activated service.
+builds and tests the application; `.#system` includes its COM2-activated service.
 
 The implementation uses one square-root UKF with bounded delayed-measurement
 replay and a coarse/fine alignment state machine. Sensor simulation is test-only.
 The module README describes local CMake builds, configuration, recording/replay,
 and the state interface. Set the measured GNSS lever arm and mounting rotation
 before using navigation output; the checked-in geometry is provisional.
+
+## Integrated radar, navigation and recording
+
+`nixos/instrument.nix` integrates the separate radar repository through a private
+SSH Git source input, `radar-src`. Its package uses the same `usdr.library` as
+SDR++ and the native probe. There is no GNU Radio dependency, including in tests.
+VkFFT, ImGui docking and ImPlot are pinned; CMake downloads are disabled in Nix
+builds. All services use the FlatBuffers version from the pinned Nixpkgs. Navigation and
+the recorder share MCAP headers with the native zlib-ng CRC backend. Chunk and
+data-section IEEE CRC coverage is retained; the wire format is unchanged.
+The radar package retains the existing PL64 preset's Alder Lake CPU target;
+builders and runtime hosts must support its instruction set.
+
+The integration changes are staged in both repositories for review. Until the
+radar changes are committed and its pin updated, use the local-source workflow
+below. The checked-in pin identifies the last pushed radar revision, which
+predates the new service. No commits or pushes are made by these helpers.
+
+### Development without coordinated commits
+
+On the Mac, with the two sibling checkouts:
+
+```sh
+./scripts/radar-build                    # Build/check the radar package
+./scripts/radar-build pl64-system-tools  # Build/check GUI, recorder and SAR foundation
+./scripts/radar-build pl64-ins           # Build/check navigation and lifecycle recovery
+./scripts/radar-build system             # Build the complete NixOS closure
+./scripts/radar-build --dev              # Incremental CMake build inside the Nix environment
+```
+
+`PL64_BUILDER` defaults to `daniel@daniel-ubuntu-vm.local`. Override it for another
+x86 Linux builder. `PL64_SSH_CONFIG` optionally selects an SSH config file;
+`PL64_REMOTE_ROOT` defaults to `pl64-dev` below the builder user's home.
+`PL64_RADAR_SOURCE` optionally selects another radar checkout.
+
+The helper syncs the configuration and radar trees separately, includes new and
+uncommitted source files, and excludes Git metadata, build products and recording
+data. On the builder, `radar-build-local` makes a small filtered source snapshot
+for the input override. Its mutable `radar/build/nix` tree stays outside that
+snapshot, so repeated `--dev` runs reuse object files rather than importing the
+build directory into the Nix store. The committed lock is never changed.
+
+On a Linux development machine with both checkouts, use the same helper locally:
+
+```sh
+./scripts/radar-build-local --dev
+./scripts/radar-build-local system
+```
+
+Or explicitly override an existing Git checkout (new files must be added to Git,
+but do not need committing):
+
+```sh
+nix build .#dvbt-passive-radar \
+  --override-input radar-src "git+file://$HOME/sources/dvbt_passive_radar"
+```
+
+At a deployment checkpoint, commit and push the reviewed radar changes, then run
+`nix flake update radar-src` on a machine with Nix and GitHub SSH access. Review
+and commit the resulting lock update here. GitHub credentials are needed by the
+input fetcher, not by a sandboxed build or the running PL64. Syncing local source
+to a builder avoids needing GitHub credentials there.
+
+### Service ownership and data paths
+
+```mermaid
+flowchart LR
+  R[DVB-T capture] -->|shared profile records| S[SAR subscription foundation]
+  N[IMU/GNSS UKF] -->|navigation records| S
+  R --> L[MCAP recorder]
+  N --> L
+  S --> L
+  L --> D[Multi-topic session MCAPs]
+  G[ImGui control] <-->|local control/status sockets| R
+  G <-->|local control/status sockets| N
+  G <-->|local control/status sockets| S
+  G <-->|logging controls| L
+  R -->|small display previews| G
+```
+
+| Process | Boot behaviour | Interfaces |
+| --- | --- | --- |
+| `pl64-ins` | Existing sensor initialization and alignment lifecycle | `/run/pl64-ins/{records,control,state}.sock` |
+| `pl64-radar` | Idle; no radio or GPU is opened until Start | `/run/pl64-radar/{records,preview,control}.sock` |
+| `pl64-sar` | Idle; Start enables subscriptions | `/run/pl64-sar/{records,control}.sock` |
+| `pl64-recorder` | Subscribes independently; logging enabled | `/run/pl64-recorder/control.sock` |
+
+The radar state machine is Idle → Starting → Running → Draining → Idle, with
+Fault for errors. Stop requests drain the decoder and scientific output before
+returning Idle. Configuration is validated and changed while inactive. Radio
+capture and the managed SDR++ session share `/run/lock/pl64-radio.lock`, so they
+cannot acquire the radio simultaneously. Opening or closing the control GUI
+does not start or stop acquisition.
+Applied capture settings are saved atomically in `/var/lib/pl64-radar/settings.json`
+and restored on service restart, while capture still starts Idle. If that file
+is invalid, packaged defaults are used with a visible configuration warning.
+TPS/pilot tracking without validated RS data does not establish a usable
+scientific reference. Automatic origin calibration waits for validated data
+and rejects coordinates outside finite profile support. Acquisition and status
+continue while profiles are withheld; the GUI shows these channels as amber
+`Tracking` until their reference is calibrated.
+
+The recorder owns `/var/lib/pl64-recordings/session-*.mcap`. Each file can contain
+navigation, radar and SAR topics, with embedded binary schemas, source stream
+IDs, effective configuration, boot identity and executable paths. Recording can
+be enabled globally or selected per source. Disabling recording drains currently
+queued messages before finalizing the file. Files rotate at approximately 1 GiB
+or 15 minutes. In-progress or failed files retain `.partial.mcap`; a successful
+close renames the file to `.mcap`. Low disk space or write errors put the recorder
+in Fault without stopping capture or navigation. No recordings are deleted
+automatically. Correct the storage problem and toggle logging to resume.
+Shutdown ordering keeps the recorder alive until producers have stopped and
+drained their output.
+
+Navigation publishes all raw, decoded, health and state records, with states at
+the IMU rate. Its previous state datagram socket remains available. The NixOS
+integration disables its separate disk writer; standalone `pl64-ins` still
+defaults to its own MCAPs and 20 Hz state recording, retaining stage transitions
+and the final invalid state. Standalone radar capture retains its existing
+`DVBTLIV1` archives and export tooling. Service captures use MCAP and do not also
+write those archives or diagnostic sidecars. Navigation replay selects its own
+topic from a combined session file.
+
+### Shared-memory and timing contract
+
+The runtime is in [`cpp/runtime`](cpp/runtime/README.md). On Linux, radar
+FlatBuffers are built directly into a `memfd`, sealed immutable, and passed by
+descriptor over a Unix socket. Recorder and SAR map the same pages read-only.
+Destroying a lease acknowledges its sequence. A bounded slow subscriber is
+disconnected, and the subscribers record the discontinuity on reconnect. An
+outstanding mapping remains valid after disconnect or producer restart.
+
+This removes copies between producer and subscriber processes. Profile formation
+still has its existing GPU readback, serialization writes the shared buffer once,
+and MCAP chunking/storage and a future SAR GPU upload perform their own work.
+The GUI receives a separate, small display preview rather than the scientific
+profile stream. Its ImPlot image texture updates only when preview data or
+colour limits change.
+
+Radar MCAP records retain integer sample coordinates, profile moments, validity,
+response, noise variance, sample-clock segments, hardware epoch, device-to-host
+time anchors with query uncertainty when the driver provides them, clock
+observations and telemetry. Host
+publication timestamps and MCAP UTC indexes are not measurement-time calibration.
+Navigation retains arrival/measurement epochs, uncertainty, covariance and
+readiness. The present native uSDR driver has sample counters but no device/host query
+anchor; records mark its measurement-time mapping unavailable. That mapping and
+stream latency still need implementing/calibrating before physical SAR alignment.
+A future processor must propagate that timing uncertainty, respect
+gaps and alignment, and use measured mounting/phase-centre geometry.
+
+The SAR process currently exercises subscriptions, a bounded navigation state
+buffer, discontinuity reporting, control and MCAP output. It explicitly reports
+`processor_available=false`; image formation and autofocus are not implemented.
+The subscription worker is the attachment point for that processor. Recording
+is independent so processor failures and offline reprocessing do not compromise
+acquisition provenance.
+
+### Native uSDR gain on the current receive chain
+
+The 6 November 2026 hardware check selected **0 dB relative gain** in the radar
+repository's `recordings/live_usdr_mt_dandenong.json`. The native driver selects
+low LNA3, minimum VGA1 and no VGA2 gain. The receive chain has two amplifiers
+estimated at 20 dB each and a 200 MHz low-pass filter after the second amplifier.
+The temporary 20 dB attenuator between amplifiers was removed after testing.
+
+Median pilot-SNR estimates during the stable parts of the captures were:
+
+| Condition | uSDR relative gain | SBS | Nine |
+| --- | --- | --- | --- |
+| Original chain | 0 dB | 4.45 dB | 4.19 dB |
+| 20 dB interstage attenuator | +9 dB | 2.72 dB | 2.78 dB |
+| Attenuator removed | 0 dB | 3.76 dB | 4.22 dB |
+
+The attenuator gave no measured SNR improvement. This supports poor reception
+as the present limit; it does not exclude distortion produced before the pad.
+These are live pilot estimates, with receiver gain increased during the pad
+test, rather than a calibrated noise-figure or intercept-point measurement.
+Seven did not maintain lock, and none of the channels produced valid RS data
+in these poor reception conditions.
+
+At the final default setting, a 15-second capture measured approximately
+−17.8 dBFS RMS and −2.6 dBFS component peak, with no rail samples, missing
+samples or host discards. A repeated gain-stage sweep found +3 dB close to
+full scale and clipping at several higher settings. Details are retained in
+`artifacts/deploy-20261106/gain-comparison.json`.
+
+The deployed source is mirrored at `/etc/nixos`, with the separate radar source
+at `/var/lib/pl64-source/radar`. Until the reviewed radar changes are committed
+and its private Git pin updated, the on-host build command is:
+
+```sh
+cd /etc/nixos
+PL64_RADAR_SOURCE=/var/lib/pl64-source/radar ./scripts/radar-build-local system
+```
+
+### Control GUI and terminal commands
+
+From the PL64 console as root:
+
+```sh
+pl64-gui
+pl64-sdrpp
+```
+
+Both use fullscreen Cage on tty1, remain off at boot, and can be exited from
+inside the GUI. Control uses Session → Exit or Ctrl+Q. Switching to the other
+GUI replaces the current local display session; capture services remain separate.
+
+The control GUI defaults to 150% scaling for the 10.5-inch 1920×1280 display.
+View → UI scale offers 100–200%, including 150% and 200%, and saves the choice in
+`~/.config/pl64/control.json`. Dock positions persist in `control.ini`. A scale
+change resets the default layout to fit the effective screen area; View → Reset
+layout restores it manually. The overview strip keeps service state and logging
+visible, capture controls sit beside the range–Doppler plot, and navigation,
+recording and SAR have dockable tabs. Keys 1–9 select channels; T toggles detailed
+channel timing. View also opens the full telemetry tree and command results.
+Gain, range, integration, map update, Doppler, worker counts and channel I/Q
+logging have native controls. Full RF/site metadata is available under Advanced
+metadata & settings. Rejected commands are shown beside the capture controls.
+
+Control is available without the GUI:
+
+```sh
+pl64-ctl radar status
+pl64-ctl radar start
+pl64-ctl radar stop
+pl64-ctl ins reset
+pl64-ctl sar start
+pl64-ctl sar stop
+pl64-ctl recorder '{"op":"recording","enabled":false}'
+pl64-ctl recorder '{"op":"select","source":"radar","enabled":true}'
+pl64-mcap-check /var/lib/pl64-recordings/session-EXAMPLE.mcap
+```
+
+`pl64-ctl radar '{"op":"configure","settings":{...}}'` accepts the settings
+object returned by status, including editable capture metadata. `pl64-mcap-check`
+verifies uncompressed chunk CRCs and every FlatBuffer against its embedded
+schema, and reports topic/kind counts and recorded boundaries.
+
+`scripts/test-instrument.py --help` describes the synthetic end-to-end test.
+It runs real decoding/profile formation with a waveform fixture, uses an
+explicitly simulated navigation source, exercises controls and shared
+subscriptions, and verifies the resulting multi-topic MCAPs. It does not open
+hardware or establish physical navigation/radar accuracy.

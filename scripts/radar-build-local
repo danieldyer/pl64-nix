@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+source_dir=${PL64_RADAR_SOURCE:-../dvbt_passive_radar}
+action=${1:-dvbt-passive-radar}
+source_dir=$(cd "$source_dir" && pwd -P)
+# Keep the mutable CMake tree outside the flake snapshot. In particular, a
+# second --dev invocation must not import build/nix into the Nix store.
+radar_snapshot=$(mktemp -d "${TMPDIR:-/tmp}/pl64-radar-source.XXXXXXXX")
+trap 'rm -rf "$radar_snapshot"' EXIT
+rsync -a --exclude='/.git/' --exclude='/.agents/' --exclude='/.codex/' --exclude='/.aws/' \
+  --exclude='/build/' --exclude='/captures/' --exclude='/renders/' --exclude='/.cache/' \
+  --exclude='/compile_commands.json' --exclude='/CMakeUserPresets.json' \
+  --exclude='*.wav' --exclude='*.iq' --exclude='*.mcap' --exclude='*.dvblive' \
+  --exclude='__pycache__/' --exclude='.DS_Store' "$source_dir/" "$radar_snapshot/"
+nix_bin=$(command -v nix || true)
+if [[ -z "$nix_bin" ]]; then nix_bin=/nix/var/nix/profiles/default/bin/nix; fi
+if [[ "$action" == --dev ]]; then
+  "$nix_bin" develop path:.#radar --override-input radar-src "path:$radar_snapshot" \
+    --command bash -c 'radar-cmake "$1" && cmake --build "$1/build/nix"' bash "$source_dir"
+  exit
+fi
+if [[ ! "$action" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+  echo 'Usage: radar-build-local [dvbt-passive-radar|system|pl64-system-tools|pl64-ins|--dev]' >&2
+  exit 2
+fi
+"$nix_bin" build "path:.#$action" --override-input radar-src "path:$radar_snapshot" -L

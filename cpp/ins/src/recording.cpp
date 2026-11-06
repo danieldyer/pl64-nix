@@ -101,7 +101,8 @@ struct Recorder::Impl {
     }
 };
 Recorder::Recorder(const std::filesystem::path &path, const std::filesystem::path &schema)
-    : impl_(std::make_unique<Impl>(path, schema)) {}
+    : impl_(std::make_unique<Impl>(path, schema)) {
+}
 Recorder::~Recorder() {
     try {
         close();
@@ -171,8 +172,12 @@ void replay(const std::filesystem::path &file,
     // MCAP messages can start at any byte offset. FlatBuffers accessors require
     // alignment for the schema's 64-bit scalars, including vectors of doubles.
     std::vector<std::uint64_t> aligned;
+    bool navigation_seen = false;
     for (const auto &view :
          reader.readMessages([](const mcap::Status &s) { throw std::runtime_error(s.message); })) {
+        if (view.channel->topic != "/navigation/events")
+            continue;
+        navigation_seen = true;
         if (view.channel->messageEncoding != "flatbuffer" || !view.schema ||
             view.schema->name != "pl64.ins.fb.Record")
             throw std::runtime_error("Unexpected recording schema");
@@ -207,6 +212,8 @@ void replay(const std::filesystem::path &file,
             r.detail = f->detail()->str();
         callback(r);
     }
+    if (!navigation_seen)
+        throw std::runtime_error("Recording contains no navigation events");
 }
 Record state_record(const Estimate &e, const Earth *earth, Stamp stamp) {
     Record r;

@@ -13,4 +13,6 @@ in
   environment.systemPackages = [ usdr.library usdr.probe pkgs.vulkan-tools ];
   # Intel graphics for Vulkan compute and the local SDR++ kiosk.
   hardware.graphics.enable = true;
+  # Managed capture and SDR++ take this same lock only while using the radio.
+  systemd.tmpfiles.rules = [ "f /run/lock/pl64-radio.lock 0660 root usdr -" ];
 }

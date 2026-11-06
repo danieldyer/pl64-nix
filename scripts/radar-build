@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+builder=${PL64_BUILDER:-daniel@daniel-ubuntu-vm.local}
+remote_root=${PL64_REMOTE_ROOT:-pl64-dev}
+source_dir=${PL64_RADAR_SOURCE:-../dvbt_passive_radar}
+action=${1:-dvbt-passive-radar}
+ssh_command=(ssh)
+if [[ -n "${PL64_SSH_CONFIG:-}" ]]; then ssh_command+=(-F "$PL64_SSH_CONFIG"); fi
+printf -v remote_shell '%q ' "${ssh_command[@]}"
+if [[ ! "$remote_root" =~ ^[a-zA-Z0-9_./-]+$ || "$remote_root" == /* || "$remote_root" == *..* ]]; then
+  echo 'PL64_REMOTE_ROOT must be a simple relative directory below the builder home.' >&2
+  exit 2
+fi
+if [[ "$action" != --dev && ! "$action" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+  echo 'Usage: radar-build [dvbt-passive-radar|system|pl64-system-tools|pl64-ins|--dev]' >&2
+  exit 2
+fi
+"${ssh_command[@]}" "$builder" "mkdir -p '$remote_root/config' '$remote_root/radar'"
+rsync -az --delete -e "$remote_shell" --exclude='/.git/' --exclude='/.agents/' --exclude='/.codex/' --exclude='/.aws/' \
+  --exclude='/artifacts/' --exclude='/builder/' --exclude='/result*' \
+  --exclude='/build/' \
+  --exclude='.DS_Store' ./ "$builder:$remote_root/config/"
+rsync -az --delete -e "$remote_shell" --exclude='/.git/' --exclude='/.agents/' --exclude='/.codex/' --exclude='/.aws/' \
+  --exclude='/build/' --exclude='/captures/' --exclude='/renders/' --exclude='/.cache/' \
+  --exclude='*.wav' --exclude='*.iq' --exclude='*.mcap' --exclude='*.dvblive' \
+  --exclude='__pycache__/' --exclude='.DS_Store' "$source_dir/" "$builder:$remote_root/radar/"
+"${ssh_command[@]}" "$builder" "cd '$remote_root/config' && PL64_RADAR_SOURCE=../radar bash scripts/radar-build-local '$action'"

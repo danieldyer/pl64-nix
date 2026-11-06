@@ -2,6 +2,8 @@
 #include "ins/config.hpp"
 #include "ins/estimator.hpp"
 #include "ins/recording.hpp"
+#include "pl64/control.hpp"
+#include "pl64/flatbuffer.hpp"
 #include <arpa/inet.h>
 #include <atomic>
 #include <condition_variable>
@@ -22,7 +24,9 @@
 namespace ins {
 namespace {
 volatile std::sig_atomic_t interrupted = 0;
-void interrupt(int) { interrupted = 1; }
+void interrupt(int) {
+    interrupted = 1;
+}
 struct Fd {
     int value = -1;
     explicit Fd(int v = -1) : value(v) {}
@@ -343,6 +347,50 @@ int live(const nlohmann::json &settings, const std::filesystem::path &schema) {
     if (!std::isfinite(rotation) || rotation < 10)
         throw std::invalid_argument("Invalid log rotation");
     std::filesystem::create_directories(directory);
+    const auto socket_directory =
+        std::filesystem::path(
+            service.value("state_socket", std::string("/run/pl64-ins/state.sock")))
+            .parent_path();
+    pl64::Publisher records(
+        service.value("records_socket", (socket_directory / "records.sock").string()),
+        {"/navigation/events",
+         "pl64.ins.fb.Record",
+         pl64::read_binary(schema),
+         {{"clock", "host monotonic acquisition ns; UTC is an index, not PPS synchronization"},
+          {"configuration", settings},
+          {"effective_navigation", configuration_json(config)}}},
+        64);
+    std::atomic<bool> recording = service.value("standalone_recording", true),
+                      reset_requested = false;
+    std::mutex status_mutex;
+    nlohmann::json status{{"state", "Starting"}, {"stage", "BIT"}, {"state_monotonic_ns", 0}};
+    pl64::ControlServer control(
+        service.value("control_socket", (socket_directory / "control.sock").string()),
+        [&](const auto &request) {
+            const auto op = request.value("op", std::string("status"));
+            if (op == "recording")
+                recording = request.at("enabled").template get<bool>();
+            else if (op == "reset")
+                reset_requested = true;
+            else if (op != "status")
+                throw std::invalid_argument(
+                    "Navigation supports status, reset and standalone recording");
+            std::lock_guard lock(status_mutex);
+            auto reply = status;
+            const auto bus = records.stats();
+            reply["standalone_recording"] = recording.load();
+            reply["stream"] = {{"subscribers", bus.subscribers},
+                               {"records", bus.published},
+                               {"disconnected", bus.disconnected}};
+            reply["settings"] = settings;
+            return reply;
+        });
+    std::jthread controller([&](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            control.poll(20);
+            records.poll();
+        }
+    });
     Queue<Record> logs;
     std::atomic<bool> failed = false;
     std::mutex error_mutex;
@@ -362,7 +410,31 @@ int live(const nlohmann::json &settings, const std::filesystem::path &schema) {
             std::unique_ptr<Recorder> recorder;
             Time opened{};
             unsigned index = 0;
+            unsigned disk_state_count = 0;
+            std::optional<Record> pending_state;
+            std::uint32_t last_disk_stage = UINT32_MAX;
             while (auto r = logs.get()) {
+                const auto bytes = serialize(*r);
+                records.publish(bytes,
+                                std::uint64_t(std::max<std::int64_t>(0, r->stamp.arrival.count())),
+                                std::uint64_t(std::max<std::int64_t>(0, r->stamp.utc.count())));
+                if (!recording.load()) {
+                    if (recorder) {
+                        recorder->close();
+                        recorder.reset();
+                    }
+                    pending_state.reset();
+                    continue;
+                }
+                if (r->kind == Kind::state) {
+                    const auto stage = r->flags & 255U;
+                    if (disk_state_count++ % 10 != 0 && stage == last_disk_stage) {
+                        pending_state = *r;
+                        continue;
+                    }
+                    last_disk_stage = stage;
+                    pending_state.reset();
+                }
                 if (!recorder || seconds(r->stamp.arrival - opened) >= rotation) {
                     if (std::filesystem::space(directory).available < 256 * 1024 * 1024)
                         throw std::runtime_error("Recording disk has less than 256 MiB free");
@@ -388,6 +460,8 @@ int live(const nlohmann::json &settings, const std::filesystem::path &schema) {
                 }
                 recorder->write(*r);
             }
+            if (recorder && pending_state)
+                recorder->write(*pending_state);
             if (recorder)
                 recorder->close();
         } catch (...) {
@@ -426,7 +500,6 @@ int live(const nlohmann::json &settings, const std::filesystem::path &schema) {
             if (!gps_health->sample(stamp.arrival))
                 throw GpsFault("GNSS cadence outside 8-12 Hz; reconfiguring receiver");
         };
-        unsigned state_count = 0;
         acquisition.on_discontinuity = [&](auto reason) { estimator.reset(std::move(reason)); };
         acquisition.on_record = [&](const auto &record) { logs.put(record); };
         acquisition.on_gnss = [&](const auto &fix) { estimator.gnss(fix); };
@@ -438,13 +511,27 @@ int live(const nlohmann::json &settings, const std::filesystem::path &schema) {
             estimator.imu(sample);
             auto state = state_record(estimator.estimate(), estimator.earth(), sample.stamp);
             publisher->send(state);
-            if (state_count++ % 10 == 0)
-                logs.put(std::move(state));
+            {
+                std::lock_guard lock(status_mutex);
+                status = {{"state", "Running"},
+                          {"stage", stage_name(estimator.estimate().stage)},
+                          {"reason", estimator.estimate().reason},
+                          {"state_monotonic_ns", sample.stamp.arrival.count()},
+                          {"flags", state.flags},
+                          {"values", state.values},
+                          {"covariance", state.covariance},
+                          {"gnss_age_s", state.gnss_age_s},
+                          {"update_ms", state.update_ms},
+                          {"normalized_residual", state.normalized_residual}};
+            }
+            logs.put(std::move(state));
         };
         Fd gps;
         Time retry{}, last_report{};
         std::uint64_t sequence = 0;
         while (!interrupted && !failed.load()) {
+            if (reset_requested.exchange(false))
+                estimator.reset("Reset requested through control socket");
             const auto stamp = now();
             if (gps.value < 0 && stamp.arrival >= retry) {
                 gps = gpsd();

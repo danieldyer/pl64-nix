@@ -8,5 +8,6 @@
 /builder/nix-install.sh
 /artifacts/
 /result*
+/build/
 __pycache__/
 .DS_Store

@@ -1,23 +1,20 @@
 { pkgs }:
 let
-  mcapArchive = pkgs.fetchurl {
-    url = "https://codeload.github.com/foxglove/mcap/tar.gz/refs/tags/releases/cpp/v2.1.1";
-    sha256 = "f5ec006beccfb6d56a26fee8e460e79bed02f125eb2604159ddfbb9906d57da4";
-  };
-  mcap = pkgs.runCommand "mcap-cpp-2.1.1-headers" { } ''
-    mkdir source
-    tar -xzf ${mcapArchive} --strip-components=1 -C source
-    mkdir -p $out/include
-    cp -r source/cpp/mcap/include/mcap $out/include/
-  '';
+  mcap = import ../mcap { inherit pkgs; };
 in pkgs.stdenv.mkDerivation {
   pname = "pl64-ins";
   version = "0.1.0";
-  src = ../../cpp;
-  nativeBuildInputs = [ pkgs.cmake ];
+  src = pkgs.lib.fileset.toSource {
+    root = ../../cpp;
+    fileset = pkgs.lib.fileset.unions [
+      ../../cpp/CMakeLists.txt ../../cpp/cmake ../../cpp/tests
+      ../../cpp/runtime ../../cpp/ins
+    ];
+  };
+  nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config ];
   nativeCheckInputs = [ pkgs.python3 ];
-  buildInputs = [ pkgs.eigen pkgs.flatbuffers pkgs.nlohmann_json ];
-  cmakeFlags = [ "-DMCAP_INCLUDE_DIR=${mcap}/include" ];
+  buildInputs = [ pkgs.eigen pkgs.flatbuffers pkgs.nlohmann_json pkgs.zlib-ng ];
+  cmakeFlags = [ "-DMCAP_INCLUDE_DIR=${mcap}/include" "-DPL64_MCAP_USE_ZLIB_NG=ON" ];
   doCheck = true;
   checkPhase = ''
     runHook preCheck

@@ -1,0 +1,18 @@
+namespace pl64.system.fb;
+enum Kind:byte { Status, Gap, Image, Diagnostic, Preview }
+// Monotonic ns are in the host boot clock domain. UTC is a separate index.
+// Scientific processors must also retain their input stream IDs/sequences,
+// native sample coordinates, clock mappings, uncertainties and calibration.
+table Event {
+  kind:Kind;
+  service:string;
+  session:string;
+  monotonic_ns:ulong;
+  utc_ns:ulong;
+  detail_json:string;
+  width:uint;
+  height:uint;
+  pixels:[float];
+}
+root_type Event;
+file_identifier "P64E";

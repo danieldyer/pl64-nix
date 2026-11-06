@@ -1,7 +1,8 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, utils, ... }:
 let
   cfg = config.services.pl64-ins;
   settings = pkgs.writeText "pl64-ins.json" (builtins.toJSON cfg.settings);
+  imuDeviceUnit = "${utils.escapeSystemdPath cfg.settings.service.imu_device}.device";
   recoverGps = pkgs.writeShellApplication {
     name = "pl64-ins-recover-gps";
     runtimeInputs = [ pkgs.systemd ];
@@ -30,7 +31,7 @@ in {
     environment.systemPackages = [ cfg.package ];
     services.pl64-ins.settings = {
       service = {
-        imu_device = lib.mkDefault "/dev/pl64com1";
+        imu_device = lib.mkDefault "/dev/pl64com2";
         state_socket = lib.mkDefault "/run/pl64-ins/state.sock";
         log_directory = lib.mkDefault "/var/lib/pl64-ins";
         rotation_s = lib.mkDefault 900;
@@ -48,8 +49,8 @@ in {
     };
     systemd.services.pl64-ins = {
       description = "IMU/GNSS navigation and raw sensor recording";
-      bindsTo = [ "dev-pl64com1.device" ];
-      after = [ "dev-pl64com1.device" ];
+      bindsTo = [ imuDeviceUnit ];
+      after = [ imuDeviceUnit ];
       # A missing/powered-off IMU behind the present USB serial adapter must
       # keep retrying, including after unsuccessful startup configuration.
       startLimitIntervalSec = 0;
