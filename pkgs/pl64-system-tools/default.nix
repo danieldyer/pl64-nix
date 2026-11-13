@@ -23,7 +23,7 @@ in pkgs.stdenv.mkDerivation {
       ../../cpp/runtime ../../cpp/services ../../cpp/ins/schema
     ];
   };
-  nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config ];
+  nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config pkgs.python3 ];
   buildInputs = [ pkgs.nlohmann_json pkgs.flatbuffers pkgs.glfw pkgs.libGL pkgs.zlib-ng ];
   cmakeFlags = [
     "-DPL64_BUILD_INS=OFF" "-DPL64_BUILD_SERVICES=ON" "-DPL64_BUILD_GUI=ON"

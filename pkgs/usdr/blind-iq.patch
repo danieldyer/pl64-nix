@@ -1,0 +1,232 @@
+diff --git a/src/lib/device/m2_lm6_1/m2_lm6_1.c b/src/lib/device/m2_lm6_1/m2_lm6_1.c
+index 71b1c6e..13cd2bd 100644
+--- a/src/lib/device/m2_lm6_1/m2_lm6_1.c
++++ b/src/lib/device/m2_lm6_1/m2_lm6_1.c
+@@ -224,6 +224,8 @@ static int usdr_device_m2_lm6_1_calibrate_get(pdevice_t ud, pusdr_vfs_obj_t obj,
+ 
+ static int dev_m2_lm6_1_sdr_rx_dccorrmode_set(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t value);
+ 
++static int usdr_iqc_get(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t *out);
++static int usdr_iqc_set(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t value);
+ static int usdr_applied_get(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t *out);
+ 
+ static
+@@ -254,6 +256,18 @@ const usdr_dev_param_func_t s_fparams_m2_lm6_1_rev000[] = {
+     { "/dm/sdr/0/rx/ip2corr",   { dev_m2_lm6_1_sdr_rx_ip2corr_set, NULL }},
+     { "/dm/sdr/0/tx/dccorr",    { dev_m2_lm6_1_sdr_tx_dccorr_set, NULL }},
+ 
++    { "/dm/sdr/0/rx/iqcorr", { usdr_iqc_set, usdr_iqc_get }},
++    { "/dm/sdr/0/rx/iqcorr/generation", { NULL, usdr_iqc_get }},
++    { "/dm/sdr/0/rx/iqcorr/coeff_i", { NULL, usdr_iqc_get }},
++    { "/dm/sdr/0/rx/iqcorr/coeff_q", { NULL, usdr_iqc_get }},
++    { "/dm/sdr/0/rx/iqcorr/coeff_qi", { NULL, usdr_iqc_get }},
++    { "/dm/sdr/0/rx/iqcorr/dc", { NULL, usdr_iqc_get }},
++    { "/dm/sdr/0/rx/iqcorr/raw_clips", { NULL, usdr_iqc_get }},
++    { "/dm/sdr/0/rx/iqcorr/tick", { NULL, usdr_iqc_get }},
++    { "/dm/sdr/0/rx/iqcorr/rejected", { NULL, usdr_iqc_get }},
++    { "/dm/sdr/0/rx/iqcorr/raw_power", { NULL, usdr_iqc_get }},
++    { "/dm/sdr/0/rx/iqcorr/raw_peak", { NULL, usdr_iqc_get }},
++
+     { "/dm/sdr/0/calibrate_dc", { dev_m2_lm6_1_sdr_dc_calib, NULL }},
+ 
+     { "/dm/sdr/0/rx/frequency/lob",{ dev_m2_lm6_1_sdr_rx_freq_lob_set, usdr_applied_get }},
+@@ -397,6 +411,41 @@ typedef struct param_list_idx param_list_idx_t;
+ //     { "rx_auto", USDR_RX_AUTO },
+ // };
+ 
++static int usdr_iqc_set(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t value)
++{
++    (void)obj;
++    if (value > 7) return -EINVAL;
++    return usdr_rx_iqc_set(&((struct dev_m2_lm6_1 *)ud)->d, value);
++}
++
++static int usdr_iqc_get(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t *out)
++{
++    struct usdr_dev *d = &((struct dev_m2_lm6_1 *)ud)->d;
++    const char *key = strrchr(obj->full_path, '/') + 1;
++    unsigned address = !strcmp(key, "generation") ? 2 :
++                       !strcmp(key, "coeff_i") ? 3 : !strcmp(key, "coeff_q") ? 4 :
++                       !strcmp(key, "coeff_qi") ? 5 : !strcmp(key, "dc") ? 6 :
++                       !strcmp(key, "raw_clips") ? 8 : !strcmp(key, "tick") ? 9 :
++                       !strcmp(key, "rejected") ? 11 : !strcmp(key, "raw_power") ? 12 :
++                       !strcmp(key, "raw_peak") ? 14 : 1;
++    uint32_t signature;
++    int res = usdr_rx_iqc_read(d, 0, &signature);
++    if (res) return res;
++    if (signature != 0x49514331) return -EOPNOTSUPP;
++    // Paired values belong to one correction epoch; never return torn offsets.
++    for (unsigned attempt = 0; attempt < 8; ++attempt) {
++        uint32_t before, after, low, high = 0;
++        res = usdr_rx_iqc_read(d, address >= 12 ? 15 : 2, &before);
++        res = res ? res : usdr_rx_iqc_read(d, address, &low);
++        if (address == 6 || address == 9 || address == 12)
++            res = res ? res : usdr_rx_iqc_read(d, address + 1, &high);
++        res = res ? res : usdr_rx_iqc_read(d, address >= 12 ? 15 : 2, &after);
++        if (res) return res;
++        if (before == after) { *out = (uint64_t)high << 32 | low; return 0; }
++    }
++    return -EAGAIN;
++}
++
+ static int usdr_applied_get(pdevice_t ud, pusdr_vfs_obj_t obj, uint64_t *out)
+ {
+     struct usdr_dev *d = &((struct dev_m2_lm6_1 *)ud)->d;
+@@ -1281,6 +1330,11 @@ int usdr_device_m2_lm6_1_create_stream(device_t* dev, const char* sid, const cha
+ 
+         res = usdr_calib_dc(&d->d, true);
+         res = res ? res : usdr_rxupdate_cal(&d->d);
++        if (!res && d->d.rx_iqc_mode) {
++            int iqres = usdr_rx_iqc_set(&d->d, d->d.rx_iqc_mode | 4);
++            // Older gateware has no bank 7: keep its existing manual path.
++            if (iqres != -EOPNOTSUPP) res = iqres;
++        }
+         if (res) {
+             goto rx_failed;
+         }
+diff --git a/src/lib/device/m2_lm6_1/usdr_ctrl.c b/src/lib/device/m2_lm6_1/usdr_ctrl.c
+index c39e998..45a8f15 100644
+--- a/src/lib/device/m2_lm6_1/usdr_ctrl.c
++++ b/src/lib/device/m2_lm6_1/usdr_ctrl.c
+@@ -817,6 +817,7 @@ int usdr_ctor(lldev_t dev, subdev_t sub, struct usdr_dev *d)
+     d->tx_rfic_path = USDR_TX_AUTO;
+ 
+     d->rx_corr.amp_corr = AMP_COMP_1CH_0DB;
++    d->rx_iqc_mode = 1;
+ 
+     return 0;
+ }
+@@ -1721,11 +1722,31 @@ int usdr_tx_iqimb_set(usdr_dev_t* d, int iq_amp_imb, int phase_imb)
+     return res;
+ }
+ 
++int usdr_rx_iqc_read(usdr_dev_t *d, unsigned address, uint32_t *value)
++{
++    if (!value || address > 15) return -EINVAL;
++    int res = lowlevel_reg_wr32(d->base.dev, 0, REG_CFG_PHY_0, MAKE_PHY_RD_REG(7, address << 16));
++    return res ? res : lowlevel_reg_rd32(d->base.dev, 0, REG_CFG_PHY_0, value);
++}
++
++int usdr_rx_iqc_set(usdr_dev_t *d, unsigned mode)
++{
++    if ((mode & ~7u) || ((mode & 2) && !(mode & 1))) return -EINVAL;
++    uint32_t signature;
++    int res = usdr_rx_iqc_read(d, 0, &signature);
++    if (res) return res;
++    if (signature != 0x49514331) return -EOPNOTSUPP;
++    res = lowlevel_reg_wr32(d->base.dev, 0, REG_CFG_PHY_0, MAKE_PHY_WR_SUB_REG(7, 1, mode));
++    if (!res) d->rx_iqc_mode = mode & 3;
++    return res;
++}
++
+ int usdr_rx_iqimb_set(usdr_dev_t* d, int iq_amp_imb, int phase_imb)
+ {
+     if (iq_amp_imb < -INT16_MAX || iq_amp_imb > INT16_MAX ||
+         phase_imb < IMB_PHASE_MIN || phase_imb > IMB_PHASE_MAX) return -ERANGE;
+     usdr_dev_t next = *d;
++    next.rx_iqc_mode = 0; // Explicit manual calibration overrides autonomous IQ.
+     next.rx_corr.ampl = (int64_t)iq_amp_imb * IMB_AMPL_MAX / INT16_MAX;
+     next.rx_corr.pahse = phase_imb;
+     int res = usdr_rxupdate_cal(&next);
+@@ -2121,5 +2142,11 @@ int usdr_calibrate(usdr_dev_t *d, unsigned channel, unsigned param, int* sarray)
+                 usdr_cleanup_error(&res, usdr_lms_write(d, regs[i], saved[i]));
+         usdr_cleanup_error(&res, usdr_rxupdate_cal(d));
+     } else if (sarray) memcpy(sarray, result, sizeof(result));
++    if (!res && (param & USDR_CAL_RXIQIMB)) d->rx_iqc_mode = 0;
++    if (d->rx_iqc_mode) {
++        unsigned mode = d->rx_iqc_mode == 1 ? 5 : d->rx_iqc_mode;
++        int iqres = usdr_rx_iqc_set(d, mode);
++        if (iqres != -EOPNOTSUPP) usdr_cleanup_error(&res, iqres);
++    }
+     return res;
+ }
+diff --git a/src/lib/device/m2_lm6_1/usdr_ctrl.h b/src/lib/device/m2_lm6_1/usdr_ctrl.h
+index db16ada..0f7996d 100644
+--- a/src/lib/device/m2_lm6_1/usdr_ctrl.h
++++ b/src/lib/device/m2_lm6_1/usdr_ctrl.h
+@@ -159,6 +159,7 @@ struct usdr_dev
+ 
+     struct imb_data tx_corr;
+     struct imb_data rx_corr;
++    unsigned rx_iqc_mode; // 0 manual, 1 autonomous, 3 frozen; defaults to autonomous.
+ 
+     freq_auto_band_map_t cfg_auto_rx[USDR_MAX_RX_BANDS];
+     freq_auto_band_map_t cfg_auto_tx[USDR_MAX_TX_BANDS];
+@@ -239,6 +240,8 @@ enum {
+     USDR_CAL_COARSE_1 = 512,
+     USDR_CAL_COARSE_2 = 1024,
+ };
++int usdr_rx_iqc_read(usdr_dev_t *d, unsigned address, uint32_t *value);
++int usdr_rx_iqc_set(usdr_dev_t *d, unsigned mode);
+ int usdr_calibrate(usdr_dev_t *d, unsigned channel, unsigned param, int* sarray);
+ 
+ #ifndef NO_IGPO
+diff --git a/src/utests/rfic/usdr_ctrl_test.c b/src/utests/rfic/usdr_ctrl_test.c
+index 1952c0b..db922e2 100644
+--- a/src/utests/rfic/usdr_ctrl_test.c
++++ b/src/utests/rfic/usdr_ctrl_test.c
+@@ -8,7 +8,8 @@
+ static uint8_t regs[128];
+ static unsigned phy_writes, calls, fail_at;
+ static unsigned measurement_generation, read_address, measure_failure;
+-static bool init_model, external_clock, clock_failure;
++static bool init_model, external_clock, clock_failure, iq_available;
++static unsigned phy_bank, iq_mode;
+ static uint8_t gpo[128];
+ static int dc_decode(unsigned x) { return (x & 64) ? -(int)(x & 63) : (int)(x & 63); }
+ static int bus_op(lldev_t dev, subdev_t sub, unsigned op, lsopaddr_t addr,
+@@ -59,7 +60,8 @@ static int bus_op(lldev_t dev, subdev_t sub, unsigned op, lsopaddr_t addr,
+         if (addr == 56) {
+             if (nout) {
+                 unsigned w = *(const uint32_t*)out;
+-                if (w >> 31) read_address = (w >> 16) & 255;
++                if (w >> 31) { read_address = (w >> 16) & 255; phy_bank = (w >> 24) & 127; }
++                else if ((w >> 24) == 7 && ((w >> 16) & 255) == 1) iq_mode = w & 7;
+                 else if (w == 0x06000000) ++measurement_generation;
+             }
+             if (nin) {
+@@ -68,6 +70,7 @@ static int bus_op(lldev_t dev, subdev_t sub, unsigned op, lsopaddr_t addr,
+                 if (read_address == 0) v = measurement_generation;
+                 if (read_address == 4) v = (dc_decode(regs[0x71]) + 17) * 64 * 65536;
+                 if (read_address == 5) v = (dc_decode(regs[0x72]) - 29) * 64 * 65536;
++                if (phy_bank == 7) v = read_address == 0 ? (iq_available ? 0x49514331 : 0) : iq_mode;
+                 *(int32_t*)in = v;
+             }
+         }
+@@ -141,6 +144,20 @@ int main(void)
+     before = d; fail_at = calls + 2;
+     assert(usdr_rfic_set_gain(&d,GAIN_RX_AUTO,10,NULL) == -EIO);
+     assert(memcmp(&before,&d,sizeof(d)) == 0); fail_at = 0;
++    // New controls must recognize old firmware, validate flags and preserve
++    // software state after failed I/O. Correction itself runs in the FPGA.
++    unsigned previous_iq = d.rx_iqc_mode;
++    assert(usdr_rx_iqc_set(&d,5) == -EOPNOTSUPP && d.rx_iqc_mode == previous_iq);
++    iq_available = true;
++    assert(usdr_rx_iqc_set(&d,5) == 0 && iq_mode == 5 && d.rx_iqc_mode == 1);
++    assert(usdr_rx_iqc_set(&d,3) == 0 && iq_mode == 3 && d.rx_iqc_mode == 3);
++    assert(usdr_rx_iqc_set(&d,2) == -EINVAL);
++    assert(usdr_rx_iqc_set(&d,8) == -EINVAL);
++    before = d; fail_at = calls + 3;
++    assert(usdr_rx_iqc_set(&d,0) == -EIO && d.rx_iqc_mode == 3);
++    fail_at = 0;
++    assert(usdr_rx_iqc_set(&d,0) == 0 && iq_mode == 0 && d.rx_iqc_mode == 0);
++    before = d;
+     assert(usdr_rx_iqimb_set(&d,32768,0) == -ERANGE);
+     assert(usdr_rx_iqimb_set(&d,0,IMB_PHASE_MAX+1) == -ERANGE);
+     fail_at = calls + 2;
+@@ -154,6 +171,7 @@ int main(void)
+     assert(usdr_rfic_bb_set_badwidth(&d,false,0,&bw) == 0 && bw == 0);
+     assert(usdr_set_rxdccorr(&d,true) == -EOPNOTSUPP);
+     assert(usdr_set_rxdccorr(&d,false) == 0);
++    d.rx_iqc_mode = 1;
+     regs[0x71] = 0x80; regs[0x72] = 0x80; regs[0x7c] = 0x1b;
+     d.lms.rfe_in1sel_dci = 0x80;
+     assert(!(regs[5] & 8));
+@@ -163,6 +181,7 @@ int main(void)
+     int result[8];
+     assert(usdr_calibrate(&d,0,USDR_CAL_RXLO,result) == 0);
+     assert(result[0] == -17 && result[1] == 29);
++    assert(d.rx_iqc_mode == 1 && iq_mode == 5);
+     assert(dc_decode(regs[0x71]) == -17 && dc_decode(regs[0x72]) == 29);
+     assert((regs[0x71] & 0x80) && (regs[0x72] & 0x80) && regs[0x7c] == 0x1b);
+     assert(d.rx_corr.dc_i == -17 && d.rx_corr.dc_q == 29);

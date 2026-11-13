@@ -16,6 +16,22 @@ in {
       default = import ../pkgs/pl64-ins { inherit pkgs; };
       description = "Navigation service package.";
     };
+    imuToAntennaQuaternion = lib.mkOption {
+      type = lib.types.addCheck (lib.types.listOf lib.types.number) (q:
+        let norm2 = lib.foldl' (sum: x: sum + x * x) 0.0 q;
+        in builtins.length q == 4 && norm2 > 0.999999 && norm2 < 1.000001);
+      default = [ 0.0 0.0 0.0 1.0 ];
+      example = [ 0.0 1.0 0.0 0.0 ];
+      description = ''
+        Unit quaternion [x, y, z, w] mapping the IMU's accelerometer-coordinate
+        sensor frame into the antenna body frame. The antenna frame has +Z along
+        boresight, +Y down and +X completing the right-handed frame. The IMU50
+        gyro-to-accelerometer axis correction is applied separately by the decoder.
+        Sensor noise densities remain in sensor coordinates and are rotated by
+        the estimator. Set mounting here, not in settings.navigation.sensor_to_body_xyzw.
+        The navigation position stays at the IMU; this option specifies rotation only.
+      '';
+    };
     settings = lib.mkOption {
       type = (pkgs.formats.json { }).type;
       default = { };
@@ -38,10 +54,11 @@ in {
       };
       navigation = {
         history_s = lib.mkDefault 3;
+        coarse_alignment_history_s = lib.mkDefault 60;
         # Until surveyed, assume coincident IMU and GNSS reference points.
         # Replace with the measured IMU-to-GNSS vector in body axes.
         gnss_lever_m = lib.mkDefault [ 0.0 0.0 0.0 ];
-        sensor_to_body_xyzw = lib.mkDefault [ 0.0 0.0 0.0 1.0 ];
+        sensor_to_body_xyzw = cfg.imuToAntennaQuaternion;
         imu_delay_s = lib.mkDefault 0.001;
         imu_timing_sigma_s = lib.mkDefault 0.01;
         gnss_timing_sigma_s = lib.mkDefault 0.1;

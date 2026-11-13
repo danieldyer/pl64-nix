@@ -14,9 +14,11 @@ table Record {
   timing_sigma_ns:double;
   native_counter:ulong;
   payload:[ubyte];
-  // SI units. IMU: omega xyz, specific force xyz. GNSS: lat/lon rad,
+  // SI units. IMU: omega xyz, specific force xyz, both in the mounted body frame.
+  // Metadata records the decoder frame convention and sensor_to_body_xyzw.
+  // GNSS: lat/lon rad,
   // ellipsoid height m, velocity NED m/s, position sigma NED, velocity sigma.
-  // State/truth: position in fixed origin NED, velocity, quaternion xyzw,
+  // State/truth: position in fixed origin NED, velocity, body-to-NED quaternion xyzw,
   // gyro bias, accel bias. State then appends ECEF origin xyz and a row-major
   // 3x3 rotation from fixed origin NED to ECEF (28 values when valid).
   // Covariance: row-major 15x15 in p,v,right body rotation,bg,ba order.

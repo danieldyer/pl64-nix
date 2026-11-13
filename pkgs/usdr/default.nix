@@ -7,11 +7,11 @@ let
     rev = "f7e869df29582934b87d3759e3c108d60a27e451";
     hash = "sha256-N7EEYY+K6phRr6y/6o9Tyg93pP68tHQwvNsiU2mJDFY=";
   };
-  revision = "49c3d57288826dfd1e97e9ec5638df18285fcdfe";
+  revision = "14cc62c7a0f429434c26a9235e474fc340d5e0a7";
   source = pkgs.applyPatches {
     name = "usdr-lib-essential-${builtins.substring 0 7 revision}";
     src = upstream;
-    patches = [ ./essential-rx.patch ];
+    patches = [ ./essential-rx.patch ./blind-iq.patch ];
   };
   library = pkgs.callPackage ./library.nix { inherit source revision; };
 in

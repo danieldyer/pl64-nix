@@ -12,16 +12,56 @@ int main(int argc, char **argv) try {
     std::filesystem::create_directories(opt.directory);
     std::mutex mutex;
     Json status = {
-        {"state", "Idle"}, {"enabled", true}, {"sources", Json::object()}, {"error", ""}};
-    std::atomic<bool> enabled = true;
+        {"state", "Idle"}, {"enabled", false}, {"sources", Json::object()}, {"error", ""}};
+    std::atomic<bool> enabled = false;
     std::atomic<unsigned> generation = 0;
     std::map<std::string, bool> selected{{"ins", true}, {"radar", true}, {"sar", true}};
+    Json session = Json::object();
     ControlServer control(endpoint(opt, "recorder"), [&](const Json &request) {
         const auto op = request.value("op", std::string("status"));
+        const bool starting =
+            op == "start" || (op == "recording" && request.at("enabled").get<bool>());
+        Json snapshot;
+        if (starting && !enabled.load()) {
+            snapshot = {
+                {"kind", "session_start"}, {"utc_ns", utc_ns()}, {"monotonic_ns", monotonic_ns()}};
+            for (const auto *name : {"radar", "ins", "sar"}) {
+                try {
+                    snapshot[name] = pl64::request(endpoint(opt, name), {{"op", "status"}}, 300);
+                } catch (const std::exception &e) {
+                    snapshot[name] = {{"error", e.what()}};
+                }
+            }
+            if (!snapshot["radar"].value("ok", false))
+                throw std::runtime_error("Radar service is unavailable; capture was not started");
+            const auto phase = snapshot["radar"].value("state", std::string());
+            if (phase == "Draining")
+                throw std::runtime_error("Wait for the pipeline to finish draining");
+            {
+                std::lock_guard lock(mutex);
+                session = snapshot;
+                enabled = true;
+                ++generation;
+            }
+            if (phase == "Idle" || phase == "Fault") {
+                try {
+                    auto reply = pl64::request(endpoint(opt, "radar"), {{"op", "start"}}, 500);
+                    if (!reply.value("ok", false))
+                        throw std::runtime_error(
+                            reply.value("error", std::string("Pipeline start failed")));
+                } catch (...) {
+                    enabled = false;
+                    ++generation;
+                    throw;
+                }
+            }
+        }
         std::lock_guard lock(mutex);
-        if (op == "recording") {
-            enabled = request.at("enabled").get<bool>();
-            ++generation;
+        if (op == "stop" || (op == "recording" && !starting)) {
+            if (enabled.exchange(false))
+                ++generation;
+        } else if (starting) {
+            // Idempotent: repeated starts do not split a recording session.
         } else if (op == "select") {
             const auto name = request.at("source").get<std::string>();
             if (!selected.contains(name))
@@ -29,7 +69,8 @@ int main(int argc, char **argv) try {
             selected[name] = request.at("enabled").get<bool>();
             ++generation;
         } else if (op != "status")
-            throw std::invalid_argument("Recorder supports status, recording and select");
+            throw std::invalid_argument(
+                "Recorder supports status, start, stop, recording and select");
         auto reply = status;
         reply["enabled"] = enabled.load();
         reply["selected"] = selected;
@@ -50,6 +91,8 @@ int main(int argc, char **argv) try {
         std::uint64_t opened = 0;
         std::string fault, last_path;
         bool faulted = false;
+        Json session_snapshot;
+        unsigned snapshot_generation = ~0U;
         while (true) {
             const bool shutting_down = stop.stop_requested();
             std::map<std::string, bool> selection;
@@ -60,6 +103,10 @@ int main(int argc, char **argv) try {
                 selection = selected;
                 write_enabled = enabled.load();
                 requested_generation = generation.load();
+                if (snapshot_generation != requested_generation) {
+                    session_snapshot = session;
+                    snapshot_generation = requested_generation;
+                }
             }
             bool drain_recording = shutting_down && bool(writer);
             if (shutting_down)
@@ -131,6 +178,9 @@ int main(int argc, char **argv) try {
                                         "Less than 512 MiB free; recording stopped");
                                 writer = std::make_unique<Recording>(opt.directory);
                                 opened = monotonic_ns();
+                                writer->boundary("recorder", session_snapshot);
+                                writer->boundary("recorder", {{"kind", "source_selection"},
+                                                              {"selected", selection}});
                             }
                             writer->write(name, source.input->stream(), *frame);
                             if (writer->bytes() % (16 * 1024 * 1024) < frame->bytes().size() &&

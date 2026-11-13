@@ -3,9 +3,11 @@
 #include "ins/recording.hpp"
 #include "simulator.hpp"
 #include <Eigen/Eigenvalues>
+#include <bit>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -22,7 +24,9 @@ void protocol() {
         0x11, 0x3c, 0xc9, 0xf6, 0x7f, 0x3f, 0x01, 0x97, 0x00, 0x00, 0x5f};
     const auto observed = ins::decode_imu(captured);
     check(observed && observed->counter == 197, "recorded hardware counter");
-    check(std::abs(observed->omega.x() / ins::degrees - .03999492526054382) < 1e-10 &&
+    check(std::abs(observed->omega.x() / ins::degrees + .04438591003417969) < 1e-10 &&
+              std::abs(observed->omega.y() / ins::degrees + .03999492526054382) < 1e-10 &&
+              std::abs(observed->omega.z() / ins::degrees + .04559910297393799) < 1e-10 &&
               std::abs(observed->force.z() / ins::standard_gravity - .9998593926429749) < 1e-10,
           "recorded hardware floating-point units");
     const ins::Vec3 w(.123, -.456, .789), a(1, 2, -9.8);
@@ -64,6 +68,112 @@ void protocol() {
               ins::encode_imu(ins::Vec3::Zero(), ins::Vec3(0, 0, 2 * ins::standard_gravity), 0))
               ->saturated,
           "2 g saturation");
+}
+// Literal packet fields independent of encode_imu: exercise all six signed
+// axes and the complete decode -> mounting -> recorded-measurement path.
+std::vector<std::uint8_t> wire_fixture(const ins::Vec3 &gyro_dps, const ins::Vec3 &accel_g) {
+    std::vector<std::uint8_t> wire(33);
+    wire[0] = 0x77;
+    wire[1] = 32;
+    wire[3] = 0x70;
+    wire[29] = 1;
+    for (int j = 0; j < 6; ++j) {
+        const float value = j < 3 ? gyro_dps[j] : accel_g[j - 3];
+        const auto bits = std::bit_cast<std::uint32_t>(value);
+        for (int k = 0; k < 4; ++k)
+            wire[4 + 4 * j + k] = (bits >> (8 * k)) & 255;
+    }
+    for (std::size_t i = 1; i < 32; ++i)
+        wire[32] += wire[i];
+    return wire;
+}
+void mounting() {
+    using namespace ins;
+    const std::array<Vec3, 3> axes{Vec3(0, -1, 0), Vec3(1, 0, 0), Vec3(0, 0, 1)};
+    for (int axis = 0; axis < 3; ++axis)
+        for (double sign : {-1., 1.}) {
+            const auto decoded = decode_imu(wire_fixture(sign * Vec3::Unit(axis), sign * Vec3::Unit(axis)));
+            check(decoded && (decoded->omega - sign * degrees * axes[axis]).norm() < 1e-12 &&
+                      (decoded->force - sign * standard_gravity * Vec3::Unit(axis)).norm() < 1e-12,
+                  "independent wire gyro/accel signed-axis convention");
+        }
+    Config config;
+    config.sensor_to_body = Quat(0, 0, 1, 0); // xyzw = [0,1,0,0]
+    Acquisition acquisition(config);
+    bool received = false, recorded = false;
+    const Vec3 expected_w = Vec3(-2, -1, -3) * degrees;
+    const Vec3 expected_f = Vec3(-.125, .25, -.5) * standard_gravity;
+    acquisition.on_imu = [&](const ImuSample &s) {
+        check((s.omega - expected_w).norm() < 1e-12 && (s.force - expected_f).norm() < 1e-12,
+              "IMU50 intrinsic rotation precedes antenna mounting");
+        received = true;
+    };
+    acquisition.on_record = [&](const Record &r) {
+        if (r.kind != Kind::imu)
+            return;
+        check(r.values.size() == 6 &&
+                  (Eigen::Map<const Vec3>(r.values.data()) - expected_w).norm() < 1e-12 &&
+                  (Eigen::Map<const Vec3>(r.values.data() + 3) - expected_f).norm() < 1e-12,
+              "decoded MCAP measurements share the estimator antenna frame");
+        recorded = true;
+    };
+    Record raw;
+    raw.stamp.arrival = time_from_seconds(1);
+    raw.payload = wire_fixture(Vec3(1, 2, 3), Vec3(.125, .25, .5));
+    acquisition.accept(raw);
+    check(received && recorded, "mounted wire sample delivered and recorded");
+
+    // The same physical propagation expressed in an arbitrary rotated body
+    // frame must have the same navigation covariance, including cross terms.
+    Config original, rotated;
+    original.noise.gyro_bias_walk = Vec3(1e-4, 2e-4, 3e-4);
+    original.noise.accel_bias_walk = Vec3(1e-3, 3e-3, 2e-3);
+    rotated = original;
+    const Quat mount(Eigen::AngleAxisd(.8, Vec3(1, -2, 3).normalized()));
+    rotated.sensor_to_body = mount;
+    const Mat3 rotation = mount.toRotationMatrix();
+    Earth earth(-38 * degrees, 145 * degrees, 50);
+    State a, b;
+    a.attitude() = Quat(Eigen::AngleAxisd(.4, Vec3(2, 1, -3).normalized()));
+    a.gyro_bias() = Vec3(.001, -.002, .003);
+    a.accel_bias() = Vec3(.02, -.03, .01);
+    b = a;
+    b.attitude() = a.attitude() * mount.conjugate();
+    b.gyro_bias() = mount * a.gyro_bias();
+    b.accel_bias() = mount * a.accel_bias();
+    std::vector<ImuSample> x(41), y(41);
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        x[i].stamp.measurement = time_from_seconds(.005 * i);
+        x[i].omega = Vec3(.1, -.2, .3);
+        x[i].force = Vec3(.7, -.3, -9.8);
+        y[i] = x[i];
+        y[i].omega = mount * x[i].omega;
+        y[i].force = mount * x[i].force;
+    }
+    Mat15 transport = Mat15::Identity();
+    for (int i : {6, 9, 12})
+        transport.block<3, 3>(i, i) = rotation;
+    const Mat15 expected = transport * process_covariance(a, x, earth, original) * transport.transpose();
+    check((process_covariance(b, y, earth, rotated) - expected).norm() < 1e-13,
+          "mounting rotates anisotropic process noise including off-diagonal covariance");
+    const auto pa = propagate(a, x, earth), pb = propagate(b, y, earth);
+    check((pa.position() - pb.position()).norm() < 1e-10 &&
+              (pa.velocity() - pb.velocity()).norm() < 1e-10 &&
+              (pa.attitude().toRotationMatrix() - pb.attitude().toRotationMatrix() * rotation).norm() < 1e-12,
+          "mounting preserves physical trajectory and attitude");
+    for (double history : {0., 3., 121., std::numeric_limits<double>::infinity()}) {
+        bool rejected = false;
+        try {
+            configuration({{"coarse_alignment_history_s", history}});
+        } catch (const std::invalid_argument &) {
+            rejected = true;
+        }
+        check(rejected, "unbounded or unusable coarse history rejected");
+    }
+    check(Config{}.coarse_alignment_history_s == 60 && Config{}.history_s == 3,
+          "alignment history is distinct from delayed-fix history");
+    check(configuration_json(configuration(configuration_json(config))) == configuration_json(config),
+          "nonidentity mounting and tuning survive configuration serialization");
 }
 void physics() {
     ins::Earth earth(-38 * ins::degrees, 145 * ins::degrees, 50);
@@ -321,6 +431,7 @@ void deterministic_replay() {
 int main() {
     try {
         protocol();
+        mounting();
         physics();
         clocks_and_noise();
         recording();

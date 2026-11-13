@@ -19,6 +19,9 @@ std::string_view stage_name(Stage s) {
 void Config::validate() const {
     if (imu_rate != 200 || !std::isfinite(history_s) || history_s < 1 || history_s > 10)
         throw std::invalid_argument("Invalid IMU cadence or delayed-measurement history");
+    if (!std::isfinite(coarse_alignment_history_s) || coarse_alignment_history_s < 4 ||
+        coarse_alignment_history_s > 120)
+        throw std::invalid_argument("Coarse alignment history must be between 4 and 120 seconds");
     const std::array positive{
         gyro_initial_sigma,  accel_initial_sigma,      gnss_position_floor,
         gnss_velocity_floor, navigation_heading_sigma, imu_timing_sigma_s,
@@ -35,6 +38,10 @@ void Config::validate() const {
             throw std::invalid_argument("Invalid IMU noise density");
     if (!std::isfinite(imu_delay_s) || std::abs(imu_delay_s) > .5)
         throw std::invalid_argument("Invalid IMU latency");
+}
+Mat3 Config::body_noise_covariance(const Vec3 &density) const {
+    const Mat3 rotation = sensor_to_body.toRotationMatrix();
+    return rotation * density.array().square().matrix().asDiagonal() * rotation.transpose();
 }
 Config configuration(const nlohmann::json &j) {
     Config c;
@@ -59,6 +66,7 @@ Config configuration(const nlohmann::json &j) {
     }
     c.imu_rate = j.value("imu_rate_hz", c.imu_rate);
     c.history_s = j.value("history_s", c.history_s);
+    c.coarse_alignment_history_s = j.value("coarse_alignment_history_s", c.coarse_alignment_history_s);
     c.imu_delay_s = j.value("imu_delay_s", c.imu_delay_s);
     c.imu_timing_sigma_s = j.value("imu_timing_sigma_s", c.imu_timing_sigma_s);
     c.gnss_timing_sigma_s = j.value("gnss_timing_sigma_s", c.gnss_timing_sigma_s);
@@ -78,6 +86,7 @@ nlohmann::json configuration_json(const Config &c) {
     auto a = [](const auto &v) { return std::vector<double>(v.data(), v.data() + v.size()); };
     return {{"imu_rate_hz", c.imu_rate},
             {"history_s", c.history_s},
+            {"coarse_alignment_history_s", c.coarse_alignment_history_s},
             {"gnss_lever_m", a(c.gnss_lever)},
             {"sensor_to_body_xyzw", a(c.sensor_to_body.coeffs())},
             {"imu_delay_s", c.imu_delay_s},

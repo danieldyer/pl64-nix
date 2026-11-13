@@ -1,0 +1,586 @@
+diff --git a/README.md b/README.md
+index 194ba38..f6ffe59 100644
+--- a/README.md
++++ b/README.md
+@@ -1,2 +1,12 @@
+ # usdr-fpga
+ FPGA for uSDR
++
++The PCIe receive path includes autonomous blind DC/IQ correction. Raw 12-bit
++moments feed a sequential integer solver every 2^20 complex samples; mean and
++matrix coefficients commit together, with clipping/conditioning rejection.
++Correction precedes the existing FIR/DMA path and needs no host solver. PHY RX
++bank 7 identifies itself as IQC1; subregister 1 controls enable/freeze/reset
++(bits 0/1/2). The matched library enables it after analog startup calibration.
++Manual bank-5 commits retain their legacy behavior and select manual mode.
++`tests/run_rx_tests.sh` includes solver, waveform, signed-offset and lifecycle
++regressions. Readback exposes correction epochs plus raw ADC power/peak/clips.
+diff --git a/hw/usdr/app_usdr_pcie.v b/hw/usdr/app_usdr_pcie.v
+index c8f61b5..fc54975 100644
+--- a/hw/usdr/app_usdr_pcie.v
++++ b/hw/usdr/app_usdr_pcie.v
+@@ -305,7 +305,8 @@ wire cal_host_clk, cal_host_rst;
+ wire [31:0] cal_host_data;
+ wire [1:0] cal_wvalid, cal_wready, cal_rvalid, cal_rready;
+ wire [63:0] cal_rdata;
+-wire [31:0] rx_cmd, tx_cmd, rx_result;
++wire [31:0] rx_cmd, tx_cmd, rx_result, rx_measure_result, rx_blind_result;
++assign rx_result = rx_cmd[30:24]==7 ? rx_blind_result : rx_measure_result;
+ wire rx_cmd_valid, tx_cmd_valid;
+ wire [31:0] raw_data = {rxd_demux_data[23:12],4'b0,rxd_demux_data[11:0],4'b0};
+ wire [31:0] corrected_data;
+@@ -323,9 +324,9 @@ usdr_cal_bridge tx_bridge (
+ usdr_iq_matrix rx_matrix (
+  .clk(rxclk_f_clk), .rst(rx_cal_rst), .cmd(rx_cmd), .cmd_valid(rx_cmd_valid),
+  .in_data(raw_data), .in_valid(rxd_demux_valid),
+- .out_data(corrected_data), .out_valid(corrected_valid), .clipped(corrected_clip));
++ .out_data(corrected_data), .out_valid(corrected_valid), .clipped(corrected_clip), .blind_result(rx_blind_result));
+ usdr_rx_measure measure (
+- .clk(rxclk_f_clk), .rst(rx_cal_rst), .cmd(rx_cmd), .cmd_valid(rx_cmd_valid), .result(rx_result),
++ .clk(rxclk_f_clk), .rst(rx_cal_rst), .cmd(rx_cmd), .cmd_valid(rx_cmd_valid), .result(rx_measure_result),
+  .raw_data(raw_data), .raw_valid(rxd_demux_valid),
+  .iq_data(corrected_data), .iq_valid(corrected_valid), .iq_clipped(corrected_clip));
+ usdr_tx_test test_generator (
+diff --git a/hw/usdr/build.tcl b/hw/usdr/build.tcl
+index 27ed0fe..e6465a8 100644
+--- a/hw/usdr/build.tcl
++++ b/hw/usdr/build.tcl
+@@ -56,6 +56,20 @@ wait_on_run impl_1
+ if {[get_property PROGRESS [get_runs impl_1]] ne "100%"} {error "Implementation failed"}
+ open_run impl_1
+ phys_opt_design -directive AggressiveExplore
++# Routing can leave a few picoseconds on a high-fanout FIR clock-enable path.
++# Refine the routed checkpoint rather than weakening clocks or emitting a
++# failing image. The ordinary setup/hold/skew guards below remain mandatory.
++for {set refinement 0} {$refinement < 3} {incr refinement} {
++    set setup [get_timing_paths -delay_type max -max_paths 1]
++    set hold [get_timing_paths -delay_type min -max_paths 1]
++    if {![llength $setup] || ![llength $hold]} {error "Missing timing paths"}
++    if {[get_property SLACK $setup] >= 0 && [get_property SLACK $hold] >= 0} {break}
++    phys_opt_design -directive AggressiveExplore
++    set setup [get_timing_paths -delay_type max -max_paths 1]
++    set hold [get_timing_paths -delay_type min -max_paths 1]
++    if {[get_property SLACK $setup] >= 0 && [get_property SLACK $hold] >= 0} {break}
++    route_design -directive Explore
++}
+ report_timing_summary -delay_type min_max -report_unconstrained -file "$output/timing.rpt"
+ set skew_report [report_bus_skew -return_string -file "$output/bus_skew.rpt"]
+ report_cdc -details -file "$output/cdc.rpt"
+diff --git a/lib/dsp/usdr_blind_iq.v b/lib/dsp/usdr_blind_iq.v
+new file mode 100644
+index 0000000..1e97cdd
+--- /dev/null
++++ b/lib/dsp/usdr_blind_iq.v
+@@ -0,0 +1,211 @@
++// SPDX-License-Identifier: CERN-OHL-P
++// Autonomous blind DC/IQ correction controller. The solver is sequential: one
++// shared pipelined 24x24 multiplier, restoring square root and restoring divider. No CPU
++// solver, sample buffering, division operator, or continuously running servo.
++module usdr_blind_iq #(parameter WINDOW_BITS=20)(
++ input clk,rst,input [31:0] cmd,input cmd_valid,
++ input [31:0] in_data,input in_valid,
++ output reg enabled,output reg signed[15:0] dc_i,dc_q,
++ output reg signed[23:0] ci,cq,cqi,output reg[31:0] result
++);
++localparam SW=12+WINDOW_BITS+1, MW=24+WINDOW_BITS+1;
++reg restart,frozen;reg[31:0] generation,seen,rejected;
++reg[63:0] tick,applied_tick;reg[31:0] raw_clips;
++reg[11:0] peak,peak_result;reg[31:0] power_i,power_q;
++wire raw_clip=in_data[15:4]==12'h800 || in_data[15:4]==12'h7ff ||
++              in_data[31:20]==12'h800 || in_data[31:20]==12'h7ff;
++wire[11:0] mag_i=in_data[15] ? -in_data[15:4] : in_data[15:4];
++wire[11:0] mag_q=in_data[31] ? -in_data[31:20] : in_data[31:20];
++wire[31:0] stats_gen;wire signed[SW-1:0] si,sq;
++wire[MW-1:0] sii,sqq;wire signed[MW-1:0] siq;wire[WINDOW_BITS:0] clips;
++usdr_iq_stats #(.WINDOW_BITS(WINDOW_BITS)) stats(clk,rst||restart,1'b1,
++ $signed(in_data[15:4]),$signed(in_data[31:20]),in_valid,
++ stats_gen,si,sq,sii,sqq,siq,clips);
++reg[5:0] state;
++reg signed[23:0] mi,mq,mx,my;
++// Explicit single-DSP partial products keep every multiplier stage short at
++// the core's 200 MHz timing constraint. Reuse this one pipelined unit for the
++// covariance, determinant and coefficient calculations.
++(* use_dsp = "yes" *) reg[23:0] mul_ll;
++(* use_dsp = "yes" *) reg signed[23:0] mul_hh;
++(* use_dsp = "yes" *) reg signed[24:0] mul_hl,mul_lh;
++reg signed[47:0] mul_high_low,product;
++reg signed[25:0] mul_middle;
++always @(posedge clk) begin
++ mul_ll <= $unsigned(mx[11:0]) * $unsigned(my[11:0]);
++ mul_hh <= $signed(mx[23:12]) * $signed(my[23:12]);
++ mul_hl <= $signed(mx[23:12]) * $signed({1'b0,my[11:0]});
++ mul_lh <= $signed({1'b0,mx[11:0]}) * $signed(my[23:12]);
++ mul_high_low <= {mul_hh,mul_ll};
++ mul_middle <= $signed(mul_hl) + $signed(mul_lh);
++ product <= mul_high_low + ($signed({{22{mul_middle[25]}},mul_middle}) <<< 12);
++end
++reg[5:0] multiply_return;
++reg signed[49:0] vi,vq,cross;
++reg signed[23:0] a,b,c;
++reg signed[47:0] ab,determinant,determinant_min;
++reg determinant_good;
++reg[47:0] rad;
++reg[25:0] rem;
++reg[23:0] root;
++wire[27:0] sqrt_rem={rem,rad[47:46]};
++wire[27:0] sqrt_trial=({4'b0,root}<<2)|1;
++wire[23:0] sqrt_next=(root<<1)|(sqrt_rem>=sqrt_trial);
++reg[5:0] count;
++reg[24:0] denominator;
++reg[47:0] numerator,quotient;
++reg[25:0] div_rem;
++wire[25:0] div_next={div_rem[24:0],numerator[47]};
++wire div_take=div_next>={1'b0,denominator};
++wire[47:0] quotient_next={quotient[46:0],div_take};
++reg[1:0] axis;
++reg signed[23:0] scale,pending_i,pending_q,pending_qi;
++reg signed[15:0] pending_di,pending_dq;
++reg[23:0] abs_cross;
++reg[15:0] abs_dc_i,abs_dc_q,max_dc_native,dc_headroom;
++reg[24:0] row_sum;
++always @(posedge clk) begin
++ abs_dc_i <= pending_di[15] ? -pending_di : pending_di;
++ abs_dc_q <= pending_dq[15] ? -pending_dq : pending_dq;
++ max_dc_native <= abs_dc_i > abs_dc_q ? abs_dc_i : abs_dc_q;
++ dc_headroom <= 16'd32768 - max_dc_native;
++ abs_cross <= c[23] ? -c : c;
++ row_sum <= {1'b0,a} + {1'b0,abs_cross};
++end
++wire signed[49:0] raw_i=$signed({1'b0,sii}) << (24-WINDOW_BITS);
++wire signed[49:0] raw_q=$signed({1'b0,sqq}) << (24-WINDOW_BITS);
++wire signed[49:0] raw_cross=$signed(siq) << (24-WINDOW_BITS);
++// Bank 7: every result belongs to the latest coefficient generation. Readers
++// check generation before/after a multiword snapshot and retry on change.
++always @* begin
++ result=0;
++ case(cmd[23:16])
++  0:result=32'h49514331; // IQC1
++  1:result={30'b0,frozen,enabled};
++  2:result=generation;
++  3:result={{8{ci[23]}},ci};4:result={{8{cq[23]}},cq};5:result={{8{cqi[23]}},cqi};
++  6:result={{16{dc_i[15]}},dc_i};7:result={{16{dc_q[15]}},dc_q};
++  8:result=raw_clips;9:result=applied_tick[31:0];10:result=applied_tick[63:32];
++  15:result=seen;
++  11:result=rejected;12:result=power_i;13:result=power_q;14:result={16'b0,peak_result,4'b0};
++ endcase
++end
++always @(posedge clk) begin
++ restart<=0;
++ if(rst) begin
++  enabled<=1;frozen<=0;restart<=0;generation<=0;seen<=0;rejected<=0;
++  dc_i<=0;dc_q<=0;ci<=24'h7fffff;cq<=24'h7fffff;cqi<=0;
++  state<=0;tick<=0;applied_tick<=0;raw_clips<=0;peak<=0;peak_result<=0;
++  power_i<=0;power_q<=0;mx<=0;my<=0;
++ end else begin
++  if(in_valid)begin
++   tick<=tick+1'b1;
++   if(raw_clip)raw_clips<=raw_clips+1'b1;
++   if(mag_i>peak)peak<=mag_i;
++   if(mag_q>peak && mag_q>=mag_i)peak<=mag_q;
++  end
++  if(restart)begin state<=0;seen<=0;end else case(state)
++   0:if(stats_gen!=seen)begin
++    seen<=stats_gen;peak_result<=peak;peak<=0;
++    power_i<=sii>>WINDOW_BITS;power_q<=sqq>>WINDOW_BITS;
++    if(enabled && !frozen && !clips)begin
++     mi<=si >>> (WINDOW_BITS-12);mq<=sq >>> (WINDOW_BITS-12);
++     state<=1;
++    end else if(clips)rejected<=rejected+1'b1;
++   end
++   1:begin
++    pending_di<=mi >>> 8;pending_dq<=mq >>> 8;
++    pending_i<=ci;pending_q<=cq;pending_qi<=cqi;
++    mx<=mi;my<=mi;state<=16;
++   end
++   2:begin vi<=raw_i-$signed(product);mx<=mq;my<=mq;state<=17;end
++   3:begin vq<=raw_q-$signed(product);mx<=mi;my<=mq;state<=18;end
++   4:begin cross<=raw_cross-$signed(product);state<=5;end
++   5:begin
++    if(vi<(50'sd16<<24) || vq<(50'sd16<<24))begin
++     rejected<=rejected+1'b1;state<=40;
++    end else state<=15;
++   end
++   15:begin
++    if(vi[49:23]!=0 || vq[49:23]!=0)begin
++     vi<=vi>>>1;vq<=vq>>>1;cross<=cross>>>1;
++    end else begin a<=vi[23:0];b<=vq[23:0];c<=cross[23:0];state<=6;end
++   end
++   6:begin
++    if((a>>>4)>b || (b>>>4)>a)begin rejected<=rejected+1'b1;state<=40;end
++    else begin mx<=a;my<=b;state<=19;end
++   end
++   7:begin ab<=product;mx<=c;my<=c;state<=20;end
++   8:begin determinant<=ab-product;determinant_min<=ab>>>6;state<=25;end
++   25:begin determinant_good<=determinant>0 && determinant>=determinant_min;state<=26;end
++   26:begin
++    if(!determinant_good)begin rejected<=rejected+1'b1;state<=40;end
++    else begin rad<=determinant;rem<=0;root<=0;count<=0;state<=9;end
++   end
++   9:begin
++    rem<=sqrt_rem>=sqrt_trial?sqrt_rem-sqrt_trial:sqrt_rem;
++    root<=sqrt_next;rad<=rad<<2;
++    if(count==23)state<=10;else count<=count+1'b1;
++   end
++   10:begin
++    if(root==0)begin rejected<=rejected+1'b1;state<=40;end
++    else begin
++     denominator<=row_sum>{1'b0,root}?row_sum:{1'b0,root};
++     // 10% guard plus DC-dependent bound: (1-d)(1+d)<=1.
++     mx<=24'd7549747;my<={8'b0,dc_headroom};state<=21;
++    end
++   end
++   11:begin scale<=product>>>15;axis<=0;state<=12;end
++   12:begin mx<=scale;my<=axis==0?root:axis==1?a:abs_cross;state<=22;end
++   13:begin numerator<=product;quotient<=0;div_rem<=0;count<=0;state<=14;end
++   14:begin
++    div_rem<=div_take?div_next-denominator:div_next;
++    numerator<=numerator<<1;quotient<=quotient_next;
++    if(count==47)begin
++     if(quotient_next>48'h7fffff)begin rejected<=rejected+1'b1;state<=0;end
++     else begin
++      if(axis==0)pending_i<=quotient_next[23:0];
++      if(axis==1)pending_q<=quotient_next[23:0];
++      if(axis==2)pending_qi<=c[23]?quotient_next[23:0]:-$signed(quotient_next[23:0]);
++      if(axis==2)state<=40;else begin axis<=axis+1'b1;state<=12;end
++     end
++    end else count<=count+1'b1;
++   end
++   16:begin multiply_return<=2;state<=23;end
++   17:begin multiply_return<=3;state<=23;end
++   18:begin multiply_return<=4;state<=23;end
++   19:begin multiply_return<=7;state<=23;end
++   20:begin multiply_return<=8;state<=23;end
++   21:begin multiply_return<=11;state<=23;end
++   22:begin multiply_return<=13;state<=23;end
++   23:state<=24;
++   24:state<=multiply_return;
++   40:begin
++    // Offsets and coefficients become visible together on an IQ-pair boundary.
++    if(in_valid)begin
++     if(enabled && !frozen)begin
++      dc_i<=pending_di;dc_q<=pending_dq;ci<=pending_i;cq<=pending_q;cqi<=pending_qi;
++      generation<=generation+1'b1;applied_tick<=tick+1'b1;
++     end
++     state<=0;
++    end
++   end
++   default:state<=0;
++  endcase
++  // Legacy manual coefficient commits select manual mode. The matched driver
++  // explicitly reenables autonomous correction after startup calibration.
++  if(cmd_valid && !cmd[31] && cmd[30:24]==5)begin
++   enabled<=0;generation<=generation+1'b1;applied_tick<=tick+(in_valid?1'b1:1'b0);
++  end
++  if(cmd_valid && !cmd[31] && cmd[30:24]==7 && cmd[23:16]==1)begin
++   enabled<=cmd[0];frozen<=cmd[1];
++   generation<=generation+1'b1;applied_tick<=tick+(in_valid?1'b1:1'b0);
++   if(cmd[2])begin
++    restart<=1;seen<=0;state<=0;dc_i<=0;dc_q<=0;
++    ci<=24'h7fffff;cq<=24'h7fffff;cqi<=0;
++    generation<=generation+1'b1;applied_tick<=tick+(in_valid?1'b1:1'b0);
++   end
++  end
++ end
++end
++endmodule
+diff --git a/lib/dsp/usdr_iq_matrix.v b/lib/dsp/usdr_iq_matrix.v
+index 0e37ced..5f75de1 100644
+--- a/lib/dsp/usdr_iq_matrix.v
++++ b/lib/dsp/usdr_iq_matrix.v
+@@ -1,31 +1,43 @@
+ // SPDX-License-Identifier: CERN-OHL-P
+-// Q1.23 coefficients; commit all four when bank 5 is written. No DC filter.
++// Q1.23 matrix with guarded DC subtraction. Bank 5 selects legacy manual
++// coefficients; bank 7 enables autonomous raw-statistics correction.
+ module usdr_iq_matrix(
+     input clk, input rst,
+     input [31:0] cmd, input cmd_valid,
+     input [31:0] in_data, input in_valid,
+     output reg [31:0] out_data, output reg out_valid,
+-    output reg clipped
++    output reg clipped, output [31:0] blind_result
+ );
+ reg signed [23:0] staged_i, staged_q, staged_qi;
+ reg signed [23:0] ci, cq, cqi, ciq;
+-reg signed [39:0] ii, qq, iq, qi;
++wire auto_enabled;
++wire signed[15:0] dc_i,dc_q;
++wire signed[23:0] auto_i,auto_q,auto_qi;
++usdr_blind_iq blind(clk,rst,cmd,cmd_valid,in_data,in_valid,auto_enabled,dc_i,dc_q,auto_i,auto_q,auto_qi,blind_result);
++wire signed[16:0] data_i=$signed({in_data[15],in_data[15:0]})-(auto_enabled?$signed(dc_i):17'sd0);
++wire signed[16:0] data_q=$signed({in_data[31],in_data[31:16]})-(auto_enabled?$signed(dc_q):17'sd0);
++wire signed[23:0] use_i=auto_enabled?auto_i:ci, use_q=auto_enabled?auto_q:cq;
++wire signed[23:0] use_qi=auto_enabled?auto_qi:cqi, use_iq=auto_enabled?24'sd0:ciq;
++reg signed[16:0] centered_i,centered_q;
++reg signed[23:0] coefficient_i,coefficient_q,coefficient_iq,coefficient_qi;
++reg centered_valid;
++reg signed [40:0] ii, qq, iq, qi;
+ reg products_valid, sums_valid;
+-reg signed [40:0] rounded_i, rounded_q;
+-wire signed [40:0] si = {ii[39],ii} + {iq[39],iq} + 41'sd4194304;
+-wire signed [40:0] sq = {qq[39],qq} + {qi[39],qi} + 41'sd4194304;
++reg signed [41:0] rounded_i, rounded_q;
++wire signed [41:0] si = {ii[40],ii} + {iq[40],iq} + 42'sd4194304;
++wire signed [41:0] sq = {qq[40],qq} + {qi[40],qi} + 42'sd4194304;
+ function [15:0] saturate;
+-    input signed [40:0] value;
++    input signed [41:0] value;
+     begin
+-        if (value[40:38] == {3{value[38]}}) saturate = value[38:23];
+-        else saturate = value[40] ? 16'h8000 : 16'h7fff;
++        if (value[41:38] == {4{value[38]}}) saturate = value[38:23];
++        else saturate = value[41] ? 16'h8000 : 16'h7fff;
+     end
+ endfunction
+ always @(posedge clk) begin
+     if (rst) begin
+         ci <= 24'h7fffff; cq <= 24'h7fffff; cqi <= 0; ciq <= 0;
+         staged_i <= 24'h7fffff; staged_q <= 24'h7fffff; staged_qi <= 0;
+-        products_valid <= 0; sums_valid <= 0; out_valid <= 0; out_data <= 0; clipped <= 0;
++        centered_valid <= 0; products_valid <= 0; sums_valid <= 0; out_valid <= 0; out_data <= 0; clipped <= 0;
+     end else begin
+         if (cmd_valid && !cmd[31]) case (cmd[30:24])
+             2: staged_i <= cmd[23:0];
+@@ -33,18 +45,26 @@ always @(posedge clk) begin
+             4: staged_qi <= cmd[23:0];
+             5: begin ci <= staged_i; cq <= staged_q; cqi <= staged_qi; ciq <= cmd[23:0]; end
+         endcase
+-        products_valid <= in_valid;
+-        if (in_valid) begin
+-            ii <= $signed(in_data[15:0]) * ci;
+-            qq <= $signed(in_data[31:16]) * cq;
+-            iq <= $signed(in_data[31:16]) * ciq;
+-            qi <= $signed(in_data[15:0]) * cqi;
++        // Keep each sample's offsets and coefficients together through the
++        // register before multiplication. A commit never mixes two epochs.
++        centered_valid <= in_valid;
++        if(in_valid) begin
++            centered_i<=data_i;centered_q<=data_q;
++            coefficient_i<=use_i;coefficient_q<=use_q;
++            coefficient_iq<=use_iq;coefficient_qi<=use_qi;
++        end
++        products_valid <= centered_valid;
++        if (centered_valid) begin
++            ii <= centered_i * coefficient_i;
++            qq <= centered_q * coefficient_q;
++            iq <= centered_q * coefficient_iq;
++            qi <= centered_i * coefficient_qi;
+         end
+         sums_valid <= products_valid;
+         rounded_i <= si; rounded_q <= sq;
+         out_valid <= sums_valid;
+-        clipped <= sums_valid && (rounded_i[40:38] != {3{rounded_i[38]}} ||
+-                                  rounded_q[40:38] != {3{rounded_q[38]}});
++        clipped <= sums_valid && (rounded_i[41:38] != {4{rounded_i[38]}} ||
++                                  rounded_q[41:38] != {4{rounded_q[38]}});
+         if (sums_valid) out_data <= {saturate(rounded_q), saturate(rounded_i)};
+     end
+ end
+diff --git a/lib/dsp/usdr_iq_stats.v b/lib/dsp/usdr_iq_stats.v
+new file mode 100644
+index 0000000..f856198
+--- /dev/null
++++ b/lib/dsp/usdr_iq_stats.v
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: CERN-OHL-P
++// Full-rate raw moments, before digital DC/IQ correction.
++// Means/covariance are formed from these exact sums; never from corrected IQ.
++module usdr_iq_stats #(
++ parameter WIDTH=12, WINDOW_BITS=20,
++ parameter SUM_WIDTH=WIDTH+WINDOW_BITS+1,
++ parameter MOM_WIDTH=2*WIDTH+WINDOW_BITS+1
++)(
++ input clk, input rst, input enable,
++ input signed [WIDTH-1:0] in_i, in_q, input in_valid,
++ output reg [31:0] generation,
++ output reg signed [SUM_WIDTH-1:0] sum_i, sum_q,
++ output reg [MOM_WIDTH-1:0] sum_ii, sum_qq,
++ output reg signed [MOM_WIDTH-1:0] sum_iq,
++ output reg [WINDOW_BITS:0] clips
++);
++reg pv, pc;
++reg signed [WIDTH-1:0] pi,pq;
++reg signed [2*WIDTH-1:0] pii,pqq,piq;
++reg [WINDOW_BITS-1:0] count;
++reg signed [SUM_WIDTH-1:0] ai,aq;
++reg [MOM_WIDTH-1:0] aii,aqq;
++reg signed [MOM_WIDTH-1:0] aiq;
++reg [WINDOW_BITS:0] ac;
++wire signed [SUM_WIDTH-1:0] ni=ai+pi, nq=aq+pq;
++wire [MOM_WIDTH-1:0] nii=aii+$unsigned(pii), nqq=aqq+$unsigned(pqq);
++wire signed [MOM_WIDTH-1:0] niq=aiq+piq;
++wire [WINDOW_BITS:0] nc=ac+pc;
++always @(posedge clk) begin
++ if(rst) begin
++  generation<=0;sum_i<=0;sum_q<=0;sum_ii<=0;sum_qq<=0;sum_iq<=0;clips<=0;
++ end else if(enable && pv && (&count)) begin
++  generation<=generation+1'b1;sum_i<=ni;sum_q<=nq;sum_ii<=nii;sum_qq<=nqq;sum_iq<=niq;clips<=nc;
++ end
++ if(rst || !enable) begin
++  pv<=0;count<=0;ai<=0;aq<=0;aii<=0;aqq<=0;aiq<=0;ac<=0;
++ end else begin
++  pv<=in_valid;
++  if(in_valid) begin
++   pi<=in_i;pq<=in_q;pii<=in_i*in_i;pqq<=in_q*in_q;piq<=in_i*in_q;
++   pc<=(in_i=={1'b1,{(WIDTH-1){1'b0}}} || in_i=={1'b0,{(WIDTH-1){1'b1}}} ||
++        in_q=={1'b1,{(WIDTH-1){1'b0}}} || in_q=={1'b0,{(WIDTH-1){1'b1}}});
++  end
++  if(pv) begin
++   count<=count+1'b1;
++   if(&count) begin ai<=0;aq<=0;aii<=0;aqq<=0;aiq<=0;ac<=0;end
++   else begin ai<=ni;aq<=nq;aii<=nii;aqq<=nqq;aiq<=niq;ac<=nc;end
++  end
++ end
++end
++endmodule
+diff --git a/tests/run_rx_tests.sh b/tests/run_rx_tests.sh
+index 004cc5a..cf4928a 100644
+--- a/tests/run_rx_tests.sh
++++ b/tests/run_rx_tests.sh
+@@ -6,7 +6,7 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
+ cd "$root"
+ # IVERILOG_FLAGS supports an extracted Icarus installation's -B path.
+ find lib -name "*.v" ! -name ram_sxp.v > "$work/sources.txt"
+-for test in usdr_pcie_rx_buffer_test usdr_ready_test usdr_meas_test usdr_cal_bridge_test usdr_dma_stop_test usdr_rx_flow_test usdr_memwr_drain_test usdr_memwr_order_test usdr_window_test usdr_tx_test_test; do
++for test in usdr_blind_iq_test usdr_blind_iq_vectors_test usdr_pcie_rx_buffer_test usdr_ready_test usdr_meas_test usdr_cal_bridge_test usdr_dma_stop_test usdr_rx_flow_test usdr_memwr_drain_test usdr_memwr_order_test usdr_window_test usdr_tx_test_test; do
+     "${IVERILOG:-iverilog}" ${IVERILOG_FLAGS:-} -g2005 -Ihw -Ilib/usb -Ilib/pci -Ilib/dsp_fft -s "$test" -o "$work/$test" \
+         "tests/$test.v" tests/ram_sxp_model.v sym/xilinx/*.v -c "$work/sources.txt"
+     "${VVP:-vvp}" "$work/$test"
+diff --git a/tests/usdr_blind_iq_test.v b/tests/usdr_blind_iq_test.v
+new file mode 100644
+index 0000000..babd9f1
+--- /dev/null
++++ b/tests/usdr_blind_iq_test.v
+@@ -0,0 +1,53 @@
++`timescale 1ns/1ps
++module usdr_blind_iq_test;
++reg clk=0;always #5 clk=~clk;
++reg rst=1,valid=0,cv=0;reg[31:0] data=0,cmd=0;
++wire en;wire signed[15:0] di,dq;wire signed[23:0] ci,cq,cqi;wire[31:0] result;
++usdr_blind_iq #(.WINDOW_BITS(12)) dut(clk,rst,cmd,cv,data,valid,en,di,dq,ci,cq,cqi,result);
++integer k,ii,qq,ri,rq;reg running=1,inject_clip=0;
++always @(negedge clk)begin
++ if(rst || !running)valid=0;
++ else begin
++  valid=~valid;
++  if(valid)begin
++   ii=(k&1)?512:-512;qq=(k&2)?512:-512;
++   ri=ii+23;rq=(3*qq+ii)/4-17;
++   data={(rq[11:0]),4'b0,(ri[11:0]),4'b0};
++   if(inject_clip)data[15:4]=12'h800;
++   k=k+1;
++  end
++ end
++end
++task write;input[31:0] word;begin @(posedge clk);#1;cmd=word;cv=1;@(posedge clk);#1;cv=0;end endtask
++function integer absolute;input integer x;begin absolute=x<0?-x:x;end endfunction
++reg signed[23:0] saved;reg[31:0] gen;
++initial begin
++ k=0;repeat(10)@(posedge clk);#1;rst=0;
++ wait(dut.generation>=3);@(negedge clk);
++ if(di!==368 || dq!==-272)$fatal(1,"means %d %d",di,dq);
++ if(absolute(ci-4478976)>32 || absolute(cq-5971968)>32 || absolute(cqi+1492992)>32)
++  $fatal(1,"coefficients %d %d %d",ci,cq,cqi);
++ // The matrix transforms the entire known signal, not just covariance.
++ for(k=0;k<4;k=k+1)begin
++  ii=(k&1)?512:-512;qq=(k&2)?512:-512;
++  ri=ii+23;rq=(3*qq+ii)/4-17;
++  if(absolute((($signed(cq)*(rq*16-dq)+$signed(cqi)*(ri*16-di))>>>23)-
++              (($signed(ci)*(qq*16))>>>23))>1)$fatal(1,"complex waveform error");
++ end
++ saved=ci;write(32'h07010003);gen=dut.generation;
++ repeat(20000)@(posedge clk);
++ if(ci!==saved || dut.generation!==gen)$fatal(1,"freeze changed correction");
++ write(32'h07010001);inject_clip=1;
++ // Let the window containing the control transition complete, then every
++ // subsequent clipped window must be rejected without updating coefficients.
++ repeat(20000)@(posedge clk);gen=dut.generation;
++ repeat(20000)@(posedge clk);
++ if(dut.generation!==gen || !dut.rejected)$fatal(1,"clipped window accepted");
++ inject_clip=0;write(32'h07010005);
++ wait(dut.generation>gen+1);
++ write(32'h05000000);if(en)$fatal(1,"manual commit did not override auto");
++ write(32'h07010001);if(!en)$fatal(1,"auto enable failed");
++ $display("PASS autonomous fixed-point DC/IQ solver, waveform correction, freeze, clipping rejection, reset and manual override");$finish;
++end
++initial begin #5000000;$fatal(1,"watchdog state=%d gen=%d rejected=%d",dut.state,dut.generation,dut.rejected);end
++endmodule
+diff --git a/tests/usdr_blind_iq_vectors_test.v b/tests/usdr_blind_iq_vectors_test.v
+new file mode 100644
+index 0000000..408b3a7
+--- /dev/null
++++ b/tests/usdr_blind_iq_vectors_test.v
+@@ -0,0 +1,29 @@
++`timescale 1ns/1ps
++module usdr_blind_iq_vectors_test;
++reg clk=0;always #5 clk=~clk;
++reg rst=1,valid=0;reg[31:0]data=0;wire en;wire signed[15:0]di,dq;wire signed[23:0]ci,cq,cqi;wire[31:0]result;
++usdr_blind_iq #(.WINDOW_BITS(16)) dut(clk,rst,32'b0,1'b0,data,valid,en,di,dq,ci,cq,cqi,result);
++integer scenario,n,ig,qg,cross_gain,off_i,off_q,ei,eq,ec,ii,qq,ri,rq;
++function integer abs;input integer x;begin abs=x<0?-x:x;end endfunction
++initial begin
++for(scenario=0;scenario<5;scenario=scenario+1)begin
++case(scenario)
++0:begin ig=8;qg=6;cross_gain=2;off_i=23;off_q=-17;ei=4478976;eq=5971968;ec=-1492992;end
++1:begin ig=6;qg=10;cross_gain=-1;off_i=-173;off_q=61;ei=6912000;eq=4147200;ec=691200;end
++2:begin ig=10;qg=6;cross_gain=-4;off_i=-400;off_q=-250;ei=2603652;eq=4339419;ec=1735768;end
++3:begin ig=8;qg=10;cross_gain=0;off_i=0;off_q=0;ei=7549747;eq=6039798;ec=0;end
++4:begin ig=8;qg=8;cross_gain=0;off_i=0;off_q=0;ei=7549747;eq=7549747;ec=0;end
++endcase
++rst=1;valid=0;repeat(4)@(negedge clk);rst=0;
++for(n=0;n<70000;n=n+1)begin
++ ii=(n&1)?512:-512;qq=(n&2)?512:-512;
++ ri=ig*ii/8+off_i;rq=qg*qq/8+cross_gain*ii/8+off_q;
++ @(negedge clk);data={rq[11:0],4'b0,ri[11:0],4'b0};valid=1;
++ @(negedge clk);valid=0;
++end
++if(!dut.generation || abs(ci-ei)>64 || abs(cq-eq)>64 || abs(cqi-ec)>64 || di!=off_i*16 || dq!=off_q*16)
++ $fatal(1,"case %d coeff %d %d %d expected %d %d %d offsets %d %d",scenario,ci,cq,cqi,ei,eq,ec,di,dq);
++end
++$display("PASS autonomous IQ vectors: positive/negative skew, gain asymmetry, large signed offsets and balanced input");$finish;
++end
++endmodule
+diff --git a/tests/usdr_meas_test.v b/tests/usdr_meas_test.v
+index 9b51245..25239f4 100644
+--- a/tests/usdr_meas_test.v
++++ b/tests/usdr_meas_test.v
+@@ -3,9 +3,9 @@ module usdr_meas_test;
+ reg clk=0; always #5 clk=~clk;
+ reg rst=1, cmd_valid=0, valid=0;
+ reg [31:0] cmd=0, data=0;
+-wire [31:0] corrected,result;
++wire [31:0] corrected,result,blind_result;
+ wire cv,clip;
+-usdr_iq_matrix matrix(clk,rst,cmd,cmd_valid,data,valid,corrected,cv,clip);
++usdr_iq_matrix matrix(clk,rst,cmd,cmd_valid,data,valid,corrected,cv,clip,blind_result);
+ usdr_rx_measure #(.WINDOW_BITS(4)) measure(clk,rst,cmd,cmd_valid,result,data,valid,corrected,cv,clip);
+ task write; input [31:0] value; begin
+  @(negedge clk); cmd=value; cmd_valid=1; @(negedge clk); cmd_valid=0;
+@@ -37,15 +37,15 @@ initial begin
+  repeat(16) @(negedge clk); read_check(0,2); read_check(1,1);
+  // Atomic coefficient commit, unity until fourth write.
+  write(32'h02400000); write(32'h03400000); write(32'h04200000);
+- sample(1000,2000); repeat(2) @(negedge clk);
++ sample(1000,2000); repeat(3) @(negedge clk);
+  if (!cv || corrected !== {16'd2000,16'd1000}) $fatal(1,"matrix staging or valid alignment");
+  write(32'h05200000);
+- sample(1000,2000); repeat(2) @(negedge clk);
++ sample(1000,2000); repeat(3) @(negedge clk);
+  if (!cv || corrected !== {16'd1250,16'd1000}) $fatal(1,"matrix cross terms");
+  @(negedge clk); if(cv) $fatal(1,"valid extended across gap");
+  // Saturation, no wraparound.
+  write(32'h027fffff); write(32'h037fffff); write(32'h047fffff); write(32'h057fffff);
+- sample(30000,30000); repeat(2) @(negedge clk);
++ sample(30000,30000); repeat(3) @(negedge clk);
+  if(!clip || corrected !== 32'h7fff7fff) $fatal(1,"matrix saturation");
+  @(negedge clk); rst=1; repeat(3) @(negedge clk); rst=0;
+  read_check(0,0);
+@@ -63,7 +63,7 @@ initial begin
+    2: sample(-8192,0);
+    3: sample(0,-8192);
+   endcase
+-  if(n%3==0) repeat(2) @(negedge clk);
++  if(n%3==0) repeat(3) @(negedge clk);
+  end
+  repeat(16) @(negedge clk); read_check(4,131056); read_check(5,0);
+  $display("PASS raw signed means, finite windows, reset, clipping, IQ commit/alignment/saturation"); $finish;

@@ -70,7 +70,7 @@ struct Estimator::Impl {
     void trim() {
         if (samples.size() < 2)
             return;
-        Time first = samples.back().stamp.measurement - std::chrono::seconds(12);
+        Time first = samples.back().stamp.measurement - time_from_seconds(config.coarse_alignment_history_s);
         if (filter) {
             const auto cutoff =
                 samples.back().stamp.measurement - time_from_seconds(config.history_s);

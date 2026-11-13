@@ -83,6 +83,7 @@ def main():
                 wait_for(lambda service=service: request(root, service, {"op": "status"}).get("ok"))
             assert request(root, "radar", {"op": "status"})["state"] == "Idle"
             assert request(root, "sar", {"op": "status"})["state"] == "Idle"
+            assert not request(root, "recorder", {"op": "status"})["enabled"]
             assert request(root, "sar", {"op": "start"})["ok"]
             status = request(root, "radar", {"op": "status"})
             settings = status["settings"]
@@ -94,6 +95,11 @@ def main():
             invalid = dict(settings, frame_slots=1)
             assert not request(root, "radar", {"op": "configure", "settings": invalid})["ok"]
             assert request(root, "radar", {"op": "configure", "settings": settings})["ok"]
+            stored = (root / "radar-settings.json").read_bytes()
+            session_settings = dict(settings, doppler=125)
+            assert request(root, "radar", {"op": "configure", "settings": session_settings, "persist": False})["ok"]
+            assert (root / "radar-settings.json").read_bytes() == stored
+            assert request(root, "radar", {"op": "configure", "settings": settings, "persist": False})["ok"]
             gui = None
             if args.gui:
                 gui = launch("gui", [args.gui, "--runtime-dir", root, "--width", "1920", "--height", "1280",
@@ -137,10 +143,18 @@ def main():
             # separately from the first capture's natural end of fixture.
             settings.update(simulate_once=False, unpaced=False)
             assert request(root, "radar", {"op": "configure", "settings": settings})["ok"]
-            assert request(root, "radar", {"op": "start"})["ok"]
+            assert request(root, "recorder", {"op": "start"})["ok"]
             wait_for(lambda: request(root, "radar", {"op": "status"})["state"] == "Running", 90)
+            assert request(root, "recorder", {"op": "stop"})["ok"]
+            assert request(root, "radar", {"op": "status"})["state"] == "Running"
             assert request(root, "radar", {"op": "stop"})["ok"]
-            stopped = wait_for(lambda: (value if (value := request(root, "radar", {"op": "status"}))["state"] in ("Idle", "Fault") else None), 90)
+
+            def draining():
+                value = request(root, "radar", {"op": "status"})
+                assert value["state"] in ("Draining", "Idle", "Fault"), value
+                return value if value["state"] in ("Idle", "Fault") else None
+
+            stopped = wait_for(draining, 90)
             assert stopped["state"] == "Idle", stopped
             radar.send_signal(signal.SIGTERM)
             assert radar.wait(timeout=30) == 0

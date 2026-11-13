@@ -120,7 +120,7 @@ void built_in_test() {
     drive(normal, 7.005, 400, 200, 20);
     check(normal.estimate().stage == Stage::coarse_alignment, "post-gap BIT could not reacquire");
 }
-void navigation(const std::string &scenario, double heading, bool delayed = false) {
+void navigation(const std::string &scenario, double heading, bool delayed = false, bool mounted = false) {
     Simulation sim;
     sim.scenario = scenario;
     sim.heading = heading;
@@ -134,7 +134,9 @@ void navigation(const std::string &scenario, double heading, bool delayed = fals
     sim.dropout_start_s = 65;
     sim.dropout_end_s = 100;
     Config cfg;
-    cfg.gnss_lever = sim.gnss_lever;
+    if (mounted)
+        cfg.sensor_to_body = Quat(Eigen::AngleAxisd(.8, Vec3(1, -2, 3).normalized()));
+    cfg.gnss_lever = cfg.sensor_to_body * sim.gnss_lever;
     Estimator immediate(cfg), late(cfg);
     Acquisition input(cfg);
     std::multimap<Time, GnssFix> pending;
@@ -183,6 +185,7 @@ void navigation(const std::string &scenario, double heading, bool delayed = fals
             const auto &frame = *immediate.earth();
             auto truth = trajectory(sim, seconds(e.state.time)).state;
             truth.attitude() = Quat(frame.to_ecef.transpose() * origin.to_ecef) * truth.attitude();
+            truth.attitude() = truth.attitude() * cfg.sensor_to_body.conjugate();
             const Vec3 error =
                 log_rotation(Quat(e.state.attitude().conjugate() * truth.attitude()));
             if (error.norm() > 10 * degrees)
@@ -190,7 +193,7 @@ void navigation(const std::string &scenario, double heading, bool delayed = fals
         }
     });
     const auto &a = immediate.estimate(), &b = late.estimate();
-    std::cout << scenario << " heading=" << heading / degrees << " fine=" << fine
+    std::cout << scenario << " mounted=" << mounted << " heading=" << heading / degrees << " fine=" << fine
               << " ready_samples=" << ready << " wrong=" << wrong << " end=" << stage_name(a.stage)
               << "\n";
     if (scenario == "static" || scenario == "straight")
@@ -237,6 +240,7 @@ int main() {
             navigation(scenario, 125 * degrees, std::string(scenario) == "maneuver");
         navigation("maneuver", -175 * degrees);
         navigation("aircraft", -40 * degrees);
+        navigation("maneuver", 125 * degrees, true, true);
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';
         return 1;

@@ -106,19 +106,23 @@ Mat15 transition(const State &x, const ImuSample &a, const ImuSample &b, const E
     return Mat15::Identity() + f * dt + (f * f) * (dt * dt * .5);
 }
 Mat15 process_covariance(const State &initial, std::span<const ImuSample> samples,
-                         const Earth &earth, const Noise &n) {
+                         const Earth &earth, const Config &config) {
     Mat15 p = Mat15::Zero();
     State x = initial;
+    const auto &n = config.noise;
+    const Mat3 accel = config.body_noise_covariance(n.accel_density),
+               gyro = config.body_noise_covariance(n.gyro_density),
+               gyro_bias = config.body_noise_covariance(n.gyro_bias_walk),
+               accel_bias = config.body_noise_covariance(n.accel_bias_walk);
     for (std::size_t i = 1; i < samples.size(); ++i) {
         const double dt = seconds(samples[i].stamp.measurement - samples[i - 1].stamp.measurement);
         const Mat15 phi = transition(x, samples[i - 1], samples[i], earth);
         Mat15 q = Mat15::Zero();
         const Mat3 r = x.attitude().toRotationMatrix();
-        q.block<3, 3>(3, 3) =
-            r * n.accel_density.array().square().matrix().asDiagonal() * r.transpose();
-        q.block<3, 3>(6, 6) = n.gyro_density.array().square().matrix().asDiagonal();
-        q.block<3, 3>(9, 9) = n.gyro_bias_walk.array().square().matrix().asDiagonal();
-        q.block<3, 3>(12, 12) = n.accel_bias_walk.array().square().matrix().asDiagonal();
+        q.block<3, 3>(3, 3) = r * accel * r.transpose();
+        q.block<3, 3>(6, 6) = gyro;
+        q.block<3, 3>(9, 9) = gyro_bias;
+        q.block<3, 3>(12, 12) = accel_bias;
         // Trapezoidal integral of Phi Q Phi^T. Includes p/v and bias coupling.
         p = (phi * p * phi.transpose() + .5 * dt * (q + phi * q * phi.transpose())).eval();
         integrate(x.data.data(), samples[i - 1], samples[i], earth);

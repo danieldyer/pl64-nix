@@ -9,7 +9,8 @@ or zero-velocity assumption. Radar processing belongs to downstream consumers.
 The state machine is built-in test → coarse alignment → fine alignment →
 navigating, with degraded status for missing/invalid measurements. Coarse
 alignment matches integrated body specific force to GNSS velocity changes.
-It waits for independent directions and a localized attitude before starting
+It retains up to 60 seconds of IMU/GNSS history and waits for independent
+directions and a localized attitude before starting
 the UKF. Static or constant-velocity data cannot establish heading with unknown
 IMU bias. Before fine alignment, the gravity/gyro attitude and latest GNSS
 position/velocity are previews, not a time-aligned navigation solution.
@@ -75,14 +76,52 @@ Socket clients must resubscribe after a service restart.
 Nix settings live under `services.pl64-ins.settings`; standard systemd options
 control retry policy. Hardware rates/protocols are fixed to the fitted sensors.
 
-Example settings (replace the provisional mounting geometry with measurements):
+## IMU axes and antenna mounting
+
+The IMU50 decoder normalizes packet gyro axes to the accelerometer sensor frame:
+`omega_sensor = [packet_gyro_y, -packet_gyro_x, packet_gyro_z]`. Acceleration keeps
+its packet axes. This proper rotation was identified independently from the
+recorded motion, specific force and GNSS data, and accepted for production.
+It is intrinsic to the sensor interface, not a mounting adjustment.
+
+Both vectors are then rotated by the mounting quaternion. Configure that
+rotation in Nix:
+
+```nix
+services.pl64-ins.imuToAntennaQuaternion = [ 0.0 1.0 0.0 0.0 ];
+```
+
+This is the PL64 assembly's accepted mounting: antenna/body +Z is along the
+boresight, +Y points mainly down, and +X completes the right-handed frame.
+It maps packet acceleration to `[-x, y, -z]` and raw packet gyros to `[-y, -x, -z]`.
+The resulting quaternion in each state maps this antenna/body frame to the
+fixed-origin NED frame; apply it to `[0,0,1]` to obtain the boresight direction.
+Position remains at the IMU reference point, not the antenna phase centre.
+
+The binding accepts a unit quaternion `[x,y,z,w]` and defaults to identity in
+the reusable module; `nixos/pl64.nix` selects the assembly mounting above.
+It supplies `navigation.sensor_to_body_xyzw`. Set the Nix binding rather than
+defining both it and the generated JSON field. Non-Nix callers can set that
+JSON field directly. GNSS lever arms are expressed in the resulting body axes.
+
+All four IMU noise-density vectors are specified in the common accelerometer
+sensor frame, before mounting. The measured gyro X/Y densities are swapped
+with the decoder normalization; their default values are now
+`[0.592, 0.856, 0.698] degrees/sqrt(hour)`. The estimator rotates full noise
+covariances, including off-diagonal terms, for arbitrary mounting rotations.
+Do not rotate these configuration vectors again when changing the mount.
+The noise magnitudes, GNSS gates, initial bias uncertainty and readiness
+thresholds are otherwise unchanged from the validated replay.
+
+Example effective settings for this assembly (GNSS lever remains provisional):
 
 ```json
 {
   "navigation": {
     "history_s": 3,
+    "coarse_alignment_history_s": 60,
     "gnss_lever_m": [0, 0, 0],
-    "sensor_to_body_xyzw": [0, 0, 0, 1],
+    "sensor_to_body_xyzw": [0, 1, 0, 0],
     "imu_delay_s": 0.001,
     "imu_timing_sigma_s": 0.01,
     "gnss_timing_sigma_s": 0.1
@@ -95,6 +134,12 @@ maps sensor axes to body axes. All other physical parameters and their units
 are listed in `configuration_json()` in `src/config.cpp`; unknown navigation
 keys are rejected. Use the same settings for capture and replay.
 
+`coarse_alignment_history_s` is bounded to 4–120 seconds and controls only
+pre-initialization history retention. It is independent of `history_s`, the
+3-second delayed-GNSS correction buffer once the UKF is running. Retaining
+60 seconds allows separated turns/accelerations to contribute together; it
+does not impose a 60-second startup delay or relax alignment acceptance.
+
 ```sh
 ./result/bin/pl64-ins replay --config settings.json --input capture.mcap
 ```
@@ -106,6 +151,11 @@ states use `schema/navigation.fbs` inside uncompressed MCAP. Records retain host
 monotonic/UTC timestamps, estimated measurement times, native counters and clock
 uncertainty. Files are rotated, finalized on clean shutdown and never overwritten.
 Replay verifies MCAP CRCs and FlatBuffers before decoding.
+New recordings identify the normalized decoder as `imu50-gyro-y-negx-z-v1`
+in metadata and store the effective mounting and history settings. Older
+recordings retain their original decoded vectors and state frame. To apply
+the new implementation to them, replay their raw bytes with the new settings;
+do not normalize already-corrected decoded measurements a second time.
 
 The Unix datagram socket accepts a subscription datagram from a bound local
 client and sends serialized FlatBuffer `Record` messages. State values contain

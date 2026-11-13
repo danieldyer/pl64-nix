@@ -44,4 +44,8 @@ if(BUILD_TESTING)
   target_compile_definitions(service-tests PRIVATE MCAP_COMPRESSION_NO_LZ4 MCAP_COMPRESSION_NO_ZSTD
     PL64_TEST_SCHEMA="${schema_dir}/system.bfbs")
   add_test(NAME system-recording COMMAND service-tests)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME capture-control COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_capture_control.py
+    $<TARGET_FILE:pl64-recorder> $<TARGET_FILE:pl64-test-source> ${schema_dir}/navigation.bfbs
+    $<TARGET_FILE:pl64-mcap-check>)
 endif()

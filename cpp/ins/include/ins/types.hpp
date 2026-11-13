@@ -71,7 +71,9 @@ struct Estimate {
     std::string reason;
 };
 struct Noise {
-    Vec3 gyro_density = Vec3(.856, .592, .698) * degrees / 60.;
+    // Densities are in the common accelerometer-coordinate sensor frame,
+    // after the IMU50 wire gyro axes have been normalized, before mounting.
+    Vec3 gyro_density = Vec3(.592, .856, .698) * degrees / 60.;
     Vec3 accel_density = Vec3(.0849, .0877, .0890) / 60.;
     // Provisional driving noise, not fitted by a five-minute Allan capture.
     Vec3 gyro_bias_walk = Vec3::Constant(.05 * degrees / 3600.);
@@ -82,11 +84,13 @@ struct Config {
     Vec3 gnss_lever = Vec3::Zero();
     Quat sensor_to_body = Quat::Identity();
     double imu_rate = 200., history_s = 3.;
+    double coarse_alignment_history_s = 60.;
     double imu_delay_s = .001, imu_timing_sigma_s = .01, gnss_timing_sigma_s = .1;
     double gyro_initial_sigma = .1 * degrees, accel_initial_sigma = .1;
     double gnss_position_floor = 1., gnss_velocity_floor = .08;
     double gnss_correlation_s = 2., gnss_correlated_position_sigma = 1.5;
     double navigation_heading_sigma = 3. * degrees;
+    Mat3 body_noise_covariance(const Vec3 &density) const;
     void validate() const;
 };
 enum class Source { imu, gnss, clock, estimator, simulator };

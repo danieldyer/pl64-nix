@@ -65,6 +65,8 @@ def lifecycle(binary, schema, capture, case):
         start = time.monotonic()
         stopped = reset = disconnected = False
         fixed_tow = None
+        pending_gps = bytearray()
+        next_gps_batch = 0.
         try:
             while process.poll() is None and time.monotonic()-start < 9:
                 now = time.monotonic()
@@ -125,6 +127,8 @@ def lifecycle(binary, schema, capture, case):
                             tow = int((epoch - 315964800 + 18)*1000) % 604800000
                             if fixed_tow is None:
                                 fixed_tow = tow
+                            if case == 'gps_week_wrap':
+                                tow = (604799000 + int(elapsed * 1000)) % 604800000
                             if case == 'gps_duplicate':
                                 tow = fixed_tow
                             if case == 'gps_no_time':
@@ -138,19 +142,27 @@ def lifecycle(binary, schema, capture, case):
                                            not (case == 'gps_time_reset' and elapsed > 2), tow=tow)
                             if case == 'gps_silent' and elapsed > 2:
                                 packet = b'$GNTXT,unusable output\r\n'
+                            if case == 'gps_batched':
+                                pending_gps.extend(packet)
+                                packet = b''
+                                if now >= next_gps_batch:
+                                    packet = bytes(pending_gps)
+                                    pending_gps.clear()
+                                    next_gps_batch = now + 1.1
                             try:
-                                client.sendall(packet)
+                                if packet:
+                                    client.sendall(packet)
                             except (BrokenPipeError, ConnectionResetError):
                                 pass
                         next_fix = now + (1. if case == 'gps_rate' else .1)
-                    duration = 5 if case in ('gps_fix_loss', 'gps_delayed_start') else 4
+                    duration = 5 if case in ('gps_fix_loss', 'gps_delayed_start', 'gps_batched') else 4
                     if elapsed >= duration and case in ('healthy', 'no_gps', 'baud_delay', 'gps_no_fix',
-                                                        'gps_no_time', 'gps_fix_loss', 'gps_delayed_start'):
+                                                        'gps_no_time', 'gps_fix_loss', 'gps_delayed_start', 'gps_batched', 'gps_week_wrap'):
                         process.send_signal(signal.SIGTERM); stopped = True
                 if stopped:
                     break
             stdout, stderr = process.communicate(timeout=3)
-            if case in ('healthy', 'no_gps', 'baud_delay', 'gps_no_fix', 'gps_no_time', 'gps_fix_loss', 'gps_delayed_start'):
+            if case in ('healthy', 'no_gps', 'baud_delay', 'gps_no_fix', 'gps_no_time', 'gps_fix_loss', 'gps_delayed_start', 'gps_batched', 'gps_week_wrap'):
                 assert process.returncode == 0, (case, stderr)
             elif case.startswith('gps'):
                 assert process.returncode == 75, (case, stderr)
@@ -175,7 +187,8 @@ def lifecycle(binary, schema, capture, case):
             assert states[-1]['flags'] == 0, (case, states[-1])
             stages = {s['stage'] for s in states}
             if case in ('healthy', 'gps_delayed_start', 'gps_fix_loss', 'imu_silent', 'imu_reset', 'imu_counter',
-                        'imu_corrupt', 'gps_disconnect', 'gps_reset', 'gps_time_reset', 'gps_silent'):
+                        'imu_corrupt', 'gps_disconnect', 'gps_reset', 'gps_time_reset', 'gps_silent',
+                        'gps_batched', 'gps_week_wrap'):
                 assert 'coarse_alignment' in stages, (case, stages)
             if case == 'gps_fix_loss':
                 assert 'degraded' in stages, stages
@@ -201,7 +214,8 @@ if __name__ == '__main__':
                  'imu_silent', 'imu_reset', 'imu_counter',
                  'imu_corrupt', 'imu_rate', 'gps_no_fix', 'gps_no_time',
                  'gps_fix_loss', 'gps_disconnect', 'gps_silent', 'gps_duplicate',
-                 'gps_reset', 'gps_time_reset', 'gps_rate', 'gps_delayed_start'):
+                 'gps_reset', 'gps_time_reset', 'gps_rate', 'gps_delayed_start',
+                 'gps_batched', 'gps_week_wrap'):
         result = lifecycle(*sys.argv[1:], case)
         results.append(result)
         print(json.dumps(result), flush=True)

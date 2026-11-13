@@ -99,7 +99,7 @@ State propagate(State, std::span<const ImuSample>, const Earth &);
 Vec15 difference(const State &reference, const State &value);
 State displaced(State, const Vec15 &);
 Mat15 transition(const State &, const ImuSample &, const ImuSample &, const Earth &);
-Mat15 process_covariance(const State &, std::span<const ImuSample>, const Earth &, const Noise &);
+Mat15 process_covariance(const State &, std::span<const ImuSample>, const Earth &, const Config &);
 using Vec6 = Eigen::Matrix<double, 6, 1>;
 using Mat6 = Eigen::Matrix<double, 6, 6>;
 // Shared observation/noise definitions for the navigator and validation filters.

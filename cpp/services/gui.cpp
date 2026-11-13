@@ -55,7 +55,7 @@ struct Model {
                 std::string error;
                 try {
                     const auto reply =
-                        pl64::request(root / ("pl64-" + service) / "control.sock", message, 500);
+                        pl64::request(root / ("pl64-" + service) / "control.sock", message, 2000);
                     result =
                         service + " · " + message.value("op", std::string()) + ": " +
                         (reply.value("ok", false) ? "accepted"
@@ -353,7 +353,14 @@ int main(int argc, char **argv) try {
     float color_low = -80, color_high = 0;
     std::array<char, 65536> settings{};
     bool settings_loaded = false;
-    std::string settings_error;
+    std::string settings_error, preset_name = "Service settings";
+    std::array<char, 4096> config_file{};
+    int preset_index = 0;
+    bool settings_dirty = false;
+    const std::filesystem::path preset_dir = "/etc/pl64/radar-presets";
+    const char *preset_files[] = {"vhf-low.json", "vhf-high.json", "uhf-c31.json"};
+    const char *preset_labels[] = {"VHF · Seven / SBS / Nine", "VHF · Ten / ABC",
+                                   "UHF · Channel 31"};
     std::deque<double> history_time, history_headroom;
     std::uint64_t last_revision = 0;
     GLuint preview_texture = 0;
@@ -476,13 +483,17 @@ int main(int argc, char **argv) try {
                     navigation_badge(value);
                 else
                     state_badge(value);
-                if (std::string_view(name) == "DVB-T" && value.value("connected", false) &&
+                if (std::string_view(name) == "DVB-T" && text(value, "state") == "Running" &&
+                    value.value("connected", false) &&
                     std::isfinite(number(value, "recent_headroom")))
                     ImGui::TextColored(text(value, "state") != "Running" ||
                                                number(value, "recent_headroom") >= 1
                                            ? muted
                                            : amber,
                                        "%.2f× headroom", number(value, "recent_headroom"));
+                else if (std::string_view(name) == "DVB-T")
+                    ImGui::TextColored(muted, "%s",
+                                       text(value, "state") == "Idle" ? "Radio idle" : "");
                 else if (std::string_view(name) == "Navigation")
                     ImGui::TextColored(muted, "%s",
                                        text(value, "stage", "Awaiting service").c_str());
@@ -500,24 +511,123 @@ int main(int argc, char **argv) try {
         state_badge(radar);
         if (radar.value("simulation", false))
             ImGui::TextColored(amber, "Simulated input");
-        ImGui::TextWrapped("%s", text(radar, "message", "Waiting for capture service").c_str());
+        ImGui::TextWrapped("%s", text(radar, "message", "Waiting for pipeline service").c_str());
         const auto phase = text(radar, "state", "");
         const bool busy = phase != "Idle" && phase != "Fault";
+        if (!settings_loaded && radar.contains("settings")) {
+            const auto value = radar["settings"].dump(2);
+            std::snprintf(settings.data(), settings.size(), "%s", value.c_str());
+            settings_loaded = true;
+        }
+        bool configuration_pending = settings_dirty;
+        if (settings_loaded) {
+            try {
+                configuration_pending |= Json::parse(settings.data()) != radar.at("settings");
+            } catch (...) {
+                configuration_pending = true;
+            }
+        }
+        const bool logging = recorder.value("enabled", false);
         const float button_width =
             (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * .5f;
         ImGui::BeginDisabled(!radar.value("connected", false));
-        ImGui::BeginDisabled(busy);
-        if (ImGui::Button("Start capture", {button_width, 0}))
+        ImGui::BeginDisabled(busy || configuration_pending);
+        if (ImGui::Button("Start pipeline", {button_width, 0}))
             model.command("radar", {{"op", "start"}});
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginDisabled(!busy);
-        if (ImGui::Button("Stop & drain", {button_width, 0}))
+        if (ImGui::Button("Stop pipeline", {button_width, 0}))
             model.command("radar", {{"op", "stop"}});
         ImGui::EndDisabled();
         ImGui::EndDisabled();
-        for (const auto &error :
-             {command_errors["radar"], text(radar, "configuration_warning", "")})
+        ImGui::BeginDisabled(!recorder.value("connected", false));
+        ImGui::BeginDisabled(logging || configuration_pending || phase == "Draining" ||
+                             !radar.value("connected", false));
+        if (ImGui::Button("Start capture", {button_width, 0}))
+            model.command("recorder", {{"op", "start"}});
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!logging);
+        if (ImGui::Button("Stop capture", {button_width, 0}))
+            model.command("recorder", {{"op", "stop"}});
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
+        ImGui::TextColored(logging ? mint : muted, "%s",
+                           logging ? "Recording session to disk" : "Disk logging off");
+        if (configuration_pending)
+            ImGui::TextColored(amber, "Apply edited settings before starting.");
+        ImGui::BeginDisabled(busy || !radar.value("connected", false));
+        ImGui::SeparatorText("Configuration");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::Combo("##preset", &preset_index, preset_labels, 3);
+        auto load_config = [&](const std::filesystem::path &path) {
+            try {
+                if (std::filesystem::file_size(path) > 60000)
+                    throw std::runtime_error("Config exceeds 60 kB");
+                std::ifstream file(path);
+                file.exceptions(std::ios::failbit | std::ios::badbit);
+                Json value;
+                file >> value;
+                auto edit = radar.at("settings");
+                // Accept either capture metadata or a complete service settings JSON.
+                if (value.contains("metadata_json"))
+                    edit = std::move(value);
+                else
+                    edit["metadata_json"] = std::move(value);
+                const auto serialized = edit.dump(2);
+                if (serialized.size() >= settings.size())
+                    throw std::runtime_error("Effective settings exceed the editor capacity");
+                std::snprintf(settings.data(), settings.size(), "%s", serialized.c_str());
+                preset_name = path.filename().string();
+                settings_loaded = true;
+                settings_dirty = false;
+                settings_error.clear();
+                model.command("radar",
+                              {{"op", "configure"}, {"settings", edit}, {"persist", false}});
+                channel = 0;
+            } catch (const std::exception &e) {
+                settings_error = e.what();
+            }
+        };
+        if (ImGui::Button("Load preset"))
+            load_config(preset_dir / preset_files[preset_index]);
+        ImGui::SameLine();
+        if (ImGui::Button("Load JSON..."))
+            ImGui::OpenPopup("Load configuration JSON");
+        if (ImGui::BeginPopupModal("Load configuration JSON", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("Capture metadata or service settings JSON");
+            ImGui::SetNextItemWidth(440 * ui_scale);
+            ImGui::InputText("##configpath", config_file.data(), config_file.size());
+            ImGui::TextDisabled("Absolute path to a local JSON file");
+            if (ImGui::Button("Load")) {
+                load_config(config_file.data());
+                if (settings_error.empty())
+                    ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel"))
+                ImGui::CloseCurrentPopup();
+            if (!settings_error.empty())
+                ImGui::TextWrapped("%s", settings_error.c_str());
+            ImGui::EndPopup();
+        }
+        ImGui::EndDisabled();
+        ImGui::TextWrapped("%s · session only", preset_name.c_str());
+        if (radar.contains("settings")) {
+            const auto &metadata = radar["settings"].value("metadata_json", Json::object());
+            const auto capture = metadata.value("capture", Json::object());
+            ImGui::TextColored(muted, "%.3f MHz · %.0f MS/s · %s · %.0f dB",
+                               number(capture, "centre_hz") / 1e6,
+                               number(capture, "sample_rate_hz") / 1e6,
+                               text(capture, "antenna", "?").c_str(), number(capture, "gain_db"));
+            if (number(capture, "centre_hz") > 200e6)
+                ImGui::TextWrapped(
+                    "RF setup: remove the 200 MHz low-pass filter; use the selected input port.");
+        }
+        for (const auto &error : {command_errors["radar"], command_errors["recorder"],
+                                  text(radar, "configuration_warning", ""), settings_error})
             if (!error.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, amber);
                 ImGui::TextWrapped("%s", error.c_str());
@@ -533,21 +643,34 @@ int main(int argc, char **argv) try {
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted("ADC RMS/peak");
                 ImGui::TableNextColumn();
-                const auto rms = number(radar["rf"], "rms_dbfs"),
-                           peak = number(radar["rf"], "peak_dbfs");
+                auto rms = number(radar["rf"], "rms_dbfs"), peak = number(radar["rf"], "peak_dbfs");
+                const auto frontend = radar.value("frontend", Json::object());
+                if (frontend.value("supported", false)) {
+                    const auto powers = frontend.value("raw_adc_power", Json::array({0, 0}));
+                    const double power = powers.at(0).get<double>() + powers.at(1).get<double>();
+                    const double raw_peak = number(frontend, "raw_adc_peak_ci16", 0);
+                    rms = power > 0 ? 10 * std::log10(power / 4194304.) : -INFINITY;
+                    peak = raw_peak > 0 ? 20 * std::log10(raw_peak / 32768.) : -INFINITY;
+                }
                 if (std::isfinite(rms) && std::isfinite(peak))
                     ImGui::Text("%.1f / %.1f dBFS", rms, peak);
                 else
                     ImGui::TextDisabled("Unavailable");
             }
+            if (radar.value("frontend", Json::object()).value("supported", false)) {
+                const auto &f = radar["frontend"];
+                metric("Raw ADC clips", number(f, "raw_adc_clips", 0), "samples", 0);
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted("IQ correction");
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(!f.value("enabled", false) ? "Manual"
+                                       : f.value("frozen", false) ? "Frozen"
+                                                                  : "Adaptive");
+            }
             ImGui::EndTable();
         }
         if (ImGui::CollapsingHeader("Capture settings")) {
-            if (!settings_loaded && radar.contains("settings")) {
-                const auto value = radar["settings"].dump(2);
-                std::snprintf(settings.data(), settings.size(), "%s", value.c_str());
-                settings_loaded = true;
-            }
             ImGui::BeginDisabled(busy || !radar.value("connected", false));
             ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x * .42f);
             try {
@@ -569,6 +692,29 @@ int main(int argc, char **argv) try {
                     changed = true;
                 }
                 if (edit.contains("metadata_json") && edit["metadata_json"].contains("capture")) {
+                    auto &capture = edit["metadata_json"]["capture"];
+                    for (const auto &[label, key] :
+                         {std::pair{"Centre (MHz)", "centre_hz"},
+                          std::pair{"Sample rate (MS/s)", "sample_rate_hz"},
+                          std::pair{"Baseband BW (MHz)", "bandwidth_hz"}}) {
+                        double value = number(capture, key) / 1e6;
+                        if (ImGui::InputDouble(label, &value, 1, 8, "%.3f")) {
+                            capture[key] = value * 1e6;
+                            if (std::string_view(key) != "bandwidth_hz")
+                                edit["metadata_json"]["recording"][key] = value * 1e6;
+                            changed = true;
+                        }
+                    }
+                    bool blind = capture.value("blind_iq", true);
+                    if (ImGui::Checkbox("Adaptive DC / IQ correction", &blind)) {
+                        capture["blind_iq"] = blind;
+                        changed = true;
+                    }
+                    int port = capture.value("antenna", std::string("EXT")) == "W" ? 1 : 0;
+                    if (ImGui::Combo("Input port", &port, "VHF (EXT)\0UHF (W)\0")) {
+                        capture["antenna"] = port ? "W" : "EXT";
+                        changed = true;
+                    }
                     double gain = number(edit["metadata_json"]["capture"], "gain_db", 30);
                     if (ImGui::InputDouble("Requested gain (dB)", &gain, 1, 5, "%.1f")) {
                         edit["metadata_json"]["capture"]["gain_db"] = gain;
@@ -596,6 +742,7 @@ int main(int argc, char **argv) try {
                     const auto value = edit.dump(2);
                     std::snprintf(settings.data(), settings.size(), "%s", value.c_str());
                     settings_error.clear();
+                    settings_dirty = true;
                 }
             } catch (const std::exception &e) {
                 settings_error = e.what();
@@ -603,24 +750,35 @@ int main(int argc, char **argv) try {
             ImGui::PopItemWidth();
             if (ImGui::TreeNode("Advanced metadata & settings")) {
                 if (ImGui::InputTextMultiline("##settings", settings.data(), settings.size(),
-                                              {-1, 240 * ui_scale}))
+                                              {-1, 240 * ui_scale})) {
                     settings_error.clear();
+                    settings_dirty = true;
+                }
                 ImGui::TreePop();
             }
             if (ImGui::Button("Apply settings")) {
                 try {
-                    model.command(
-                        "radar", {{"op", "configure"}, {"settings", Json::parse(settings.data())}});
+                    model.command("radar", {{"op", "configure"},
+                                            {"settings", Json::parse(settings.data())},
+                                            {"persist", false}});
+                    settings_dirty = false;
                     settings_error.clear();
                 } catch (const std::exception &e) {
                     settings_error = e.what();
                 }
             }
+            ImGui::SameLine();
+            if (ImGui::Button("Discard edits")) {
+                settings_loaded = false;
+                settings_dirty = false;
+                settings_error.clear();
+            }
             ImGui::EndDisabled();
             if (!settings_error.empty())
                 ImGui::TextWrapped("%s", settings_error.c_str());
             ImGui::PushStyleColor(ImGuiCol_Text, muted);
-            ImGui::TextWrapped("Stop capture to edit settings.");
+            ImGui::TextWrapped("Stop the pipeline to edit. Apply changes for this service session; "
+                               "preset files stay unchanged.");
             ImGui::PopStyleColor();
         }
         if (ImGui::CollapsingHeader("Performance history") && history_time.size() > 2 &&
@@ -701,7 +859,7 @@ int main(int argc, char **argv) try {
                 ImGui::EndTable();
             }
         } else
-            ImGui::TextDisabled("Channel telemetry appears when capture starts.");
+            ImGui::TextDisabled("Channel telemetry appears when the pipeline starts.");
         ImGui::End();
         ImGui::Begin("Range · Doppler");
         ImGui::Checkbox("Hold", &hold);
@@ -769,8 +927,17 @@ int main(int argc, char **argv) try {
         } else {
             ImGui::Spacing();
             ImGui::TextColored(muted, "No range–Doppler preview");
-            ImGui::TextWrapped("Start a capture and select a channel. Scientific profiles are "
-                               "independent of this display.");
+            if (text(radar, "state") == "Running")
+                ImGui::TextWrapped(
+                    "Waiting for valid decoded data and reference calibration on the "
+                    "selected channel. Preview does not require disk logging.");
+            else if (text(radar, "state") == "Starting")
+                ImGui::TextWrapped("Warming up the DVB-T pipeline. Preview does not require disk "
+                                   "logging.");
+            else
+                ImGui::TextWrapped(
+                    "Start the DVB-T pipeline and select a channel. Preview does not "
+                    "require disk logging.");
         }
         ImGui::End();
         ImGui::Begin("Navigation");
@@ -834,7 +1001,11 @@ int main(int argc, char **argv) try {
         bool enabled = recorder.value("enabled", false);
         ImGui::BeginDisabled(!recorder.value("connected", false));
         if (ImGui::Checkbox("Record to disk", &enabled))
-            model.command("recorder", {{"op", "recording"}, {"enabled", enabled}});
+            model.command("recorder", {{"op", enabled ? "start" : "stop"}});
+        if (!command_errors["recorder"].empty())
+            ImGui::TextWrapped("%s", command_errors["recorder"].c_str());
+        ImGui::TextWrapped(
+            "Capture records selected sources. Stopping capture leaves the pipeline running.");
         for (const auto *source : {"ins", "radar", "sar"}) {
             bool selected = recorder.value("selected", Json::object()).value(source, true);
             const char *title = std::string_view(source) == "ins"     ? "Navigation"

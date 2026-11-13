@@ -258,23 +258,29 @@ struct GpsFault : std::runtime_error {
 struct Cadence {
     Time last, window;
     unsigned count = 0;
-    double minimum, maximum;
+    double minimum, maximum, measured_rate = 0;
+    bool native_clock = false;
     Cadence(Time start, double low, double high)
         : last(start), window(start), minimum(low), maximum(high) {}
-    bool sample(Time time) {
-        last = time;
-        // Startup latency is not a sample interval. The independent stale()
-        // deadline still covers the wait for the first decoded packet.
-        if (!count)
+    bool sample(Time arrival, std::optional<Time> epoch = {}) {
+        last = arrival;
+        const auto time = epoch.value_or(arrival);
+        // Delivery can be batched by USB/gpsd. Measure a receiver's cadence on
+        // its native epochs when available; freshness always uses host arrival.
+        // Establishing native time starts a new rate window, not a mixed clock.
+        if (!count || native_clock != epoch.has_value()) {
             window = time;
+            count = 0;
+            native_clock = epoch.has_value();
+        }
         ++count;
         const double elapsed = seconds(time - window);
         if (elapsed < 2)
             return true;
-        const double rate = (count - 1) / elapsed;
+        measured_rate = (count - 1) / elapsed;
         window = time;
         count = 1;
-        return rate >= minimum && rate <= maximum;
+        return measured_rate >= minimum && measured_rate <= maximum;
     }
     bool stale(Time time, double limit) const { return seconds(time - last) > limit; }
 };
@@ -358,7 +364,8 @@ int live(const nlohmann::json &settings, const std::filesystem::path &schema) {
          pl64::read_binary(schema),
          {{"clock", "host monotonic acquisition ns; UTC is an index, not PPS synchronization"},
           {"configuration", settings},
-          {"effective_navigation", configuration_json(config)}}},
+          {"effective_navigation", configuration_json(config)},
+          {"imu_frame_convention", imu_frame_convention}}},
         64);
     std::atomic<bool> recording = service.value("standalone_recording", true),
                       reset_requested = false;
@@ -451,6 +458,7 @@ int live(const nlohmann::json &settings, const std::filesystem::path &schema) {
                     meta.stamp = r->stamp;
                     meta.detail =
                         nlohmann::json{{"navigation", configuration_json(config)},
+                                       {"imu_frame_convention", imu_frame_convention},
                                        {"schema_path", schema.string()},
                                        {"service", service},
                                        {"clock", "steady_clock + system_clock; timestamps are not "
@@ -483,6 +491,7 @@ int live(const nlohmann::json &settings, const std::filesystem::path &schema) {
         Cadence imu_health(now().arrival, 180, 220);
         std::optional<Cadence> gps_health;
         std::optional<std::uint32_t> gps_tow;
+        Time gps_elapsed{};
         acquisition.on_gnss_packet = [&](std::uint32_t tow, bool time_valid, const Stamp &stamp) {
             if (time_valid && tow >= 604800000)
                 throw GpsFault("GNSS invalid time-of-week counter");
@@ -494,11 +503,15 @@ int live(const nlohmann::json &settings, const std::filesystem::path &schema) {
                 const auto step = (tow + 604800000 - *gps_tow) % 604800000;
                 if (step > 1000)
                     throw GpsFault("GNSS epoch discontinuity; reconfiguring receiver");
+                gps_elapsed += std::chrono::milliseconds(step);
             }
             if (time_valid)
                 gps_tow = tow;
-            if (!gps_health->sample(stamp.arrival))
-                throw GpsFault("GNSS cadence outside 8-12 Hz; reconfiguring receiver");
+            const auto epoch = time_valid ? std::optional<Time>{gps_elapsed} : std::nullopt;
+            if (!gps_health->sample(stamp.arrival, epoch))
+                throw GpsFault("GNSS cadence outside 8-12 Hz (" +
+                               std::to_string(gps_health->measured_rate) +
+                               " Hz); reconfiguring receiver");
         };
         acquisition.on_discontinuity = [&](auto reason) { estimator.reset(std::move(reason)); };
         acquisition.on_record = [&](const auto &record) { logs.put(record); };

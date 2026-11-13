@@ -1,7 +1,10 @@
 { lib, ... }:
 {
-  imports = [ ./navigation.nix ./ins.nix ./usdr.nix ./sdrpp.nix ./instrument.nix ];
+  imports = [ ./navigation.nix ./ins.nix ./usdr.nix ./sdrpp.nix ./instrument.nix ./ethernet.nix ];
   services.pl64-ins.enable = true;
+  # Accepted motion-inferred mounting: antenna +Z = -packet Z, +Y = packet Y,
+  # +X = -packet X. Decoder first normalizes gyro [y,-x,z] into packet accel axes.
+  services.pl64-ins.imuToAntennaQuaternion = [ 0.0 1.0 0.0 0.0 ];
   networking.hostName = "pl64";
   services.avahi = {
     enable = true;

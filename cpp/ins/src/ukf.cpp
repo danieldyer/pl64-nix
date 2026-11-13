@@ -90,7 +90,7 @@ void Ukf::propagate(std::span<const ImuSample> samples) {
         const double phi = std::exp(-dt / config_.gnss_correlation_s);
         Mat18 q = Mat18::Zero();
         q.topLeftCorner<15, 15>() =
-            process_covariance(state_, samples.subspan(i - 1, 2), earth_, config_.noise);
+            process_covariance(state_, samples.subspan(i - 1, 2), earth_, config_);
         q.bottomRightCorner<3, 3>().diagonal().setConstant(config_.gnss_correlated_position_sigma *
                                                            config_.gnss_correlated_position_sigma *
                                                            (1 - phi * phi));

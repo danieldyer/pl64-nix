@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'">
+<title>PL64 · Navigation playback</title>
+<style>
+:root{color-scheme:dark;--bg:#10191e;--panel:#17232a;--line:#2c3b43;--muted:#a2b2bb;--text:#edf2f3;--teal:#62e2bf;--blue:#72b6f4;--amber:#f5c268;--red:#f28e82;--green:#77d59c}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden}
+button,select,input{font:inherit}button,select{color:var(--text);background:#22323a;border:1px solid #3a4c56;border-radius:7px;padding:7px 11px;cursor:pointer}button:hover,select:hover{background:#30454e}button:disabled{opacity:.4;cursor:default}button:focus-visible,select:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--teal);outline-offset:3px}button.active{border-color:var(--teal);color:var(--teal)}label{cursor:pointer}input[type=checkbox]{accent-color:var(--teal)}a{color:inherit}small,.muted{color:var(--muted)}.eyebrow{text-transform:uppercase;font-size:10px;font-weight:700;letter-spacing:1.7px;color:var(--muted)}
+header{display:flex;align-items:center;gap:22px;padding:14px 22px;border-bottom:1px solid var(--line);flex-wrap:wrap}h1{font-size:19px;margin:0;font-weight:650;letter-spacing:-.4px}header .title{margin-right:auto}.subtitle{font-size:12px;color:var(--muted);margin-top:2px}.control-label{font-size:11px;color:var(--muted);display:block;margin-bottom:3px}header select{min-width:200px}.offline{font-size:10px;letter-spacing:1px;color:var(--teal);border:1px solid #315c50;padding:4px 7px;border-radius:4px}
+main{min-height:0;flex:1;display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:1px;background:var(--line)}#map-wrap{position:relative;overflow:hidden;background:#e7e9e1}#map{display:block;width:100%;height:100%;touch-action:none;cursor:grab}#map.dragging{cursor:grabbing}.map-tools{position:absolute;top:16px;left:16px;display:flex;gap:6px;flex-wrap:wrap}.map-tools button{background:#17232af2;box-shadow:0 2px 8px #0002}.map-note{position:absolute;top:64px;left:16px;max-width:calc(100% - 32px);color:#33464e;background:#ffffffe8;border-radius:5px;padding:5px 9px;font-size:12px;pointer-events:none}.map-note:empty{display:none}.legend{position:absolute;left:16px;bottom:32px;background:#fffffff0;color:#33464e;border-radius:7px;padding:8px 12px;font-size:12px;display:flex;gap:15px;flex-wrap:wrap;box-shadow:0 2px 8px #0001;max-width:calc(100% - 32px)}.legend label{display:flex;align-items:center;gap:5px}.legend .swatch{width:18px;height:3px;display:inline-block;border-radius:2px}.attribution{position:absolute;bottom:0;right:0;padding:3px 7px;background:#ffffffe8;color:#4c5c64;font-size:10px}.north{position:absolute;top:16px;right:18px;color:#233a44;font-size:12px;display:grid;text-align:center;font-weight:700;pointer-events:none}.north span{font-size:25px;line-height:1}
+aside{overflow:auto;background:var(--panel);padding:20px}aside section+section{border-top:1px solid var(--line);margin-top:17px;padding-top:17px}.status-line{display:flex;justify-content:space-between;align-items:center;margin:6px 0}.status{font-size:18px;font-weight:650;letter-spacing:-.3px}.dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:7px}#reason{font-size:12px;color:var(--muted);min-height:36px;margin-top:4px}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:13px 0 0}.metric strong{display:block;font-size:23px;font-variant-numeric:tabular-nums;font-weight:550;letter-spacing:-.7px}.metric span{font-size:11px;color:var(--muted)}.metric small{font-size:13px}.readout{display:flex;justify-content:space-between;font-size:12px;margin-top:8px;gap:6px}.readout b{font-weight:500;font-variant-numeric:tabular-nums;text-align:right}.readout span{color:var(--muted)}#horizon{display:block;width:100%;height:178px;margin-top:8px}#mount{width:100%;font-size:12px;margin:10px 0 6px}.caution{font-size:11px;color:#e9c88e;line-height:1.5}.attitude-values{display:flex;justify-content:space-evenly;text-align:center}.attitude-values strong{font-size:22px;font-weight:550;font-variant-numeric:tabular-nums}.attitude-values small{display:block;font-size:11px}details{font-size:12px;color:var(--muted)}summary{cursor:pointer;color:var(--text)}details p{margin:9px 0}#run-note{margin-top:10px;font-size:11px;color:var(--muted)}
+footer{padding:14px 22px 12px;border-top:1px solid var(--line)}.transport{display:flex;align-items:center;gap:9px;flex-wrap:wrap}#play{background:var(--teal);color:#102e28;border-color:var(--teal);font-weight:650;min-width:98px}#time{font-size:20px;font-weight:550;font-variant-numeric:tabular-nums;letter-spacing:-.6px;margin-left:7px}#duration{color:var(--muted);font-size:14px}.clock{margin-left:auto;text-align:right;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}.timeline-wrap{position:relative;margin:12px 0 0;height:28px}#bands{position:absolute;left:8px;right:8px;top:10px;height:10px;border-radius:4px;overflow:hidden;background:#28363e}.band{position:absolute;height:100%;opacity:.85}#scrub{position:relative;width:100%;margin:0;height:28px;appearance:none;background:transparent;cursor:pointer}#scrub::-webkit-slider-runnable-track{background:transparent;height:10px}#scrub::-moz-range-track{background:transparent;height:10px}#scrub::-webkit-slider-thumb{appearance:none;width:13px;height:24px;background:#f2f6f5;border-radius:4px;margin-top:-7px;border:2px solid #15262d;box-shadow:0 0 0 1px #f2f6f599}#scrub::-moz-range-thumb{width:9px;height:20px;background:#f2f6f5;border-radius:4px;border:2px solid #15262d}.timeline-labels{display:flex;justify-content:space-between;color:var(--muted);font-size:10px;font-variant-numeric:tabular-nums;margin:0 8px}.stage-key{display:flex;gap:13px;margin-top:7px;flex-wrap:wrap;font-size:10px;color:var(--muted)}.stage-key i{display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:4px}.shortcut{margin-left:auto;color:#71858f}
+@media(min-width:1600px){main{grid-template-columns:minmax(0,1fr) 360px}aside{padding:24px}#horizon{height:220px}body{font-size:15px}}
+@media(max-width:850px){header{padding:10px 14px;gap:10px}header .title{flex:1}header select{min-width:150px;max-width:240px;font-size:12px}.offline{display:none}main{grid-template-columns:minmax(0,1fr) 270px}aside{padding:14px}footer{padding:10px 14px}.map-tools{top:10px;left:10px}.map-tools button{padding:6px 8px;font-size:12px}.legend{left:10px;gap:8px;font-size:10px}.clock{font-size:11px}.shortcut{display:none}}
+@media(max-width:620px){body{height:auto;min-height:100dvh;overflow:auto}header .title{flex-basis:100%}header .select-group{flex:1}header select{width:100%;min-width:0}main{display:flex;flex-direction:column;flex:none}#map-wrap{height:52vh;min-height:320px}aside{display:grid;grid-template-columns:1fr 1fr;gap:14px;overflow:visible}aside section{margin:0!important;padding:0!important;border:0!important}aside section:last-child{grid-column:1/-1}#horizon{height:140px}.metric strong{font-size:20px}.status{font-size:16px}.clock{display:none}#first-nav{font-size:11px}footer{position:sticky;bottom:0;background:var(--bg);z-index:2}.map-note{top:52px}.stage-key{gap:8px}.transport{gap:5px}#time{font-size:18px}.attitude-values strong{font-size:18px}}
+</style>
+</head>
+<body>
+<header>
+ <div class="title"><div class="eyebrow">PL64 / field recordings</div><h1>Navigation playback</h1><div class="subtitle">8 November 2026 · Melbourne</div></div>
+ <div class="select-group"><label class="control-label" for="run">Recording</label><select id="run" aria-label="Recording"></select></div>
+ <div class="select-group"><label class="control-label" for="estimate">Estimate to inspect</label><select id="estimate"><option value="replay">Experimental UKF replay</option><option value="recorded">Original live estimate</option></select></div>
+ <span class="offline" title="All data, map geometry and code are embedded. No network requests.">OFFLINE</span>
+</header>
+<main>
+ <div id="map-wrap">
+  <canvas id="map" aria-label="Street map showing navigation, GNSS and antenna boresight"></canvas>
+  <div class="map-tools"><button id="fit" title="Fit the GNSS route (F)">Fit route</button><button id="follow" aria-pressed="false" title="Keep the selected estimate in view">Follow</button><button id="zoom-in" aria-label="Zoom in">+</button><button id="zoom-out" aria-label="Zoom out">−</button></div>
+  <div id="map-note" role="status"></div><div class="north"><span>↑</span>N</div>
+  <div class="legend">
+   <span><i class="swatch" id="selected-swatch" style="background:#138f78"></i> <span id="selected-legend">Replay</span></span>
+   <label><input id="show-gps" type="checkbox" checked><i class="swatch" style="background:#467bc1"></i> GNSS</label>
+   <label><input id="show-other" type="checkbox"><i class="swatch" id="other-swatch" style="background:#d47265"></i> <span id="other-legend">Original live</span></label>
+   <span><i class="swatch" style="background:#c08018"></i> Boresight</span>
+  </div>
+  <div class="attribution">Vector map © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a> · <a href="https://opendatacommons.org/licenses/odbl/1-0/" target="_blank" rel="noopener">ODbL</a></div>
+ </div>
+ <aside>
+  <section>
+   <div class="eyebrow">Navigation state</div>
+   <div class="status-line"><div class="status"><i class="dot" id="state-dot"></i><span id="state">—</span></div></div>
+   <div id="reason">Loading recording…</div>
+   <div class="metrics"><div class="metric"><strong id="speed">—</strong><span>Horizontal speed · km/h</span></div><div class="metric"><strong id="heading">—</strong><span>Boresight · ° true</span></div></div>
+   <div class="readout"><span>GNSS course</span><b id="course">—</b></div>
+   <div class="readout"><span>Heading / tilt σ</span><b id="uncertainty">—</b></div>
+   <div class="readout"><span>Last accepted GNSS</span><b id="gnss-age">—</b></div>
+   <div class="readout"><span>UKF ↔ GNSS separation</span><b id="separation">—</b></div>
+   <div class="readout"><span>Latitude / longitude</span><b id="coordinates">—</b></div>
+  </section>
+  <section>
+   <div class="eyebrow">Antenna attitude</div>
+   <canvas id="horizon" aria-label="Artificial horizon showing antenna pitch and roll"></canvas>
+   <div class="attitude-values"><div><strong id="pitch">—</strong><small>Pitch · nose up +</small></div><div><strong id="roll">—</strong><small>Roll · right down +</small></div></div>
+   <label class="control-label" for="mount" style="margin-top:12px">Boresight convention · display only</label>
+   <select id="mount"><option value="-1">−packet Z · motion-inferred</option><option value="1">+packet Z · opposite convention</option></select>
+   <div class="caution">Mounting is not bench-verified. Dashed arrows mean the filter is not yet navigating. No arrow is shown while heading is unresolved.</div>
+  </section>
+  <section>
+   <details><summary>How to read this replay</summary>
+    <p>Drag the map to pan; scroll or use + / − to zoom. “Fit route” returns to the GNSS extent. “Follow” keeps the current estimate centred. Faint lines show the full route; brighter lines show the last 60 seconds.</p>
+    <p>The experimental replay uses the real estimator with gyro axes [y, −x, z], 60 s of coarse-alignment history, and correspondingly rotated gyro-noise densities. It starts afresh at the recording boundary. The original live estimate already had pre-recording history. Neither is independent ground truth; GNSS also feeds the filter.</p>
+    <p>Pitch is boresight elevation. Roll is rotation about the boresight, with right/down axes chosen as −packet X / +packet Y for the default −packet Z direction. Choosing +Z reverses forward and right. The map remains north-up. Boresight arrow length is schematic, not a distance.</p>
+    <p>States are exported at nominal 20 Hz. Playback interpolates position and quaternion attitude only between nearby samples in the same stage and segment; gaps and alignment changes are never interpolated across. Grey timeline marks denote missing IMU data. No filter output is smoothed or adjusted to match the roads.</p>
+    <p>Space: play/pause · ← / →: step 1 s · Shift + ← / →: step 10 s · Home/End: beginning/end · F: fit route. Shortcuts are inactive while a control has keyboard focus.</p>
+    <p id="provenance"></p>
+   </details>
+   <div id="run-note"></div>
+  </section>
+ </aside>
+</main>
+<footer>
+ <div class="transport">
+  <button id="play" aria-label="Play" aria-pressed="false">▶ Play</button>
+  <button id="back" title="Back 10 seconds" aria-label="Back 10 seconds">−10 s</button>
+  <button id="forward" title="Forward 10 seconds" aria-label="Forward 10 seconds">+10 s</button>
+  <select id="rate" aria-label="Playback speed"><option value="0.25">¼×</option><option value="0.5">½×</option><option value="1" selected>1× realtime</option><option value="2">2×</option><option value="5">5×</option><option value="10">10×</option></select>
+  <span id="time">00:00.0</span><span id="duration">/ —</span>
+  <button id="first-nav" title="Jump to the first navigating state in the selected estimate">First navigating</button>
+  <div class="clock"><div id="clock">—</div><div>Recording time · AEDT</div></div>
+ </div>
+ <div class="timeline-wrap"><div id="bands"></div><input id="scrub" type="range" min="0" max="1" step="0.001" value="0" aria-label="Playback position in seconds"></div>
+ <div class="timeline-labels" id="ticks"></div>
+ <div class="stage-key"><span><i style="background:#758591"></i>BIT / gap</span><span><i style="background:#e7b45b"></i>Coarse</span><span><i style="background:#7cabeb"></i>Fine</span><span><i style="background:#77d59c"></i>Navigating</span><span><i style="background:#ee8c7f"></i>Degraded</span><span class="shortcut">Space to play · arrows to step · drag map to pan</span></div>
+</footer>
+<script id="data" type="application/json">/*__PLAYBACK_DATA__*/</script>
+<script>
+'use strict';
+const DATA=JSON.parse(document.getElementById('data').textContent);
+const $=id=>document.getElementById(id), DEG=180/Math.PI;
+const STAGE_COLOR=['#758591','#e7b45b','#7cabeb','#77d59c','#ee8c7f'];
+const COLORS={replay:'#148d76',recorded:'#ce6b60',gps:'#497fca'};
+// State columns: time,E,N,lat,lon,alt,qxyzw,vNED,stage,headingSigma,
+// tiltSigma,gnssAge,reasonId,segment,discontinuity,headingObserved.
+let run=DATA.runs[0],mode='replay',time=0,playing=false,rate=1,lastFrame=0,follow=false;
+let camera={x:0,y:0,scale:1},width=0,height=0,dpr=1,cache=null,dirty=true;
+const canvas=$('map'),ctx=canvas.getContext('2d'),horizon=$('horizon');
+let clockFormat=new Intl.DateTimeFormat('en-AU',{timeZone:'Australia/Melbourne',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const fmt=(v,n=1)=>Number.isFinite(v)?v.toFixed(n):'—';
+const signed=v=>Number.isFinite(v)?(v>=0?'+':'')+v.toFixed(1)+'°':'—';
+function timestamp(t,decimal=true){t=decimal?Math.round(t*10)/10:Math.round(t);const m=Math.floor(t/60),s=t-m*60;return String(m).padStart(2,'0')+':'+s.toFixed(decimal?1:0).padStart(decimal?4:2,'0');}
+function upper(rows,t){let lo=0,hi=rows.length;while(lo<hi){const m=(lo+hi)>>>1;if(rows[m][0]<=t)lo=m+1;else hi=m;}return lo;}
+function inGap(t){return run.gaps.some(([a,b])=>t>a&&t<b);}
+function slerp(a,b,u){let dot=a.reduce((s,v,i)=>s+v*b[i],0);if(dot<0){b=b.map(v=>-v);dot=-dot;}let p=1-u,q=u;if(dot<.9995){const angle=Math.acos(clamp(dot,-1,1)),sin=Math.sin(angle);p=Math.sin((1-u)*angle)/sin;q=Math.sin(u*angle)/sin;}const out=a.map((v,i)=>p*v+q*b[i]),n=Math.hypot(...out);return out.map(v=>v/n);}
+function sampleState(rows,t){
+ if(inGap(t))return null;
+ const i=upper(rows,t)-1;if(i<0)return null;
+ const a=rows[i],b=rows[i+1];if(t-a[0]>.2)return null;
+ if(!b||b[19]||b[0]-a[0]>.2||a[1]===null||b[1]===null)return a;
+ const u=clamp((t-a[0])/(b[0]-a[0]),0,1),out=a.slice();
+ for(const j of [1,2,3,4,5,10,11,12,14,15,16])if(a[j]!==null&&b[j]!==null)out[j]=a[j]+u*(b[j]-a[j]);
+ out.splice(6,4,...slerp(a.slice(6,10),b.slice(6,10),u));return out;
+}
+function sampleGps(t){
+ const i=upper(run.gps,t)-1;if(i<0)return null;
+ const a=run.gps[i],b=run.gps[i+1];if(!a[7]||t-a[0]>.3)return null;
+ if(!b||!b[7]||a[8]!==b[8]||b[0]-a[0]>.3)return a;
+ const u=clamp((t-a[0])/(b[0]-a[0]),0,1),out=a.slice();for(let j=1;j<7;j++)out[j]=a[j]+u*(b[j]-a[j]);return out;
+}
+function rotate(q,v){const [x,y,z,w]=q,[a,b,c]=v,tx=2*(y*c-z*b),ty=2*(z*a-x*c),tz=2*(x*b-y*a);return [a+w*tx+y*tz-z*ty,b+w*ty+z*tx-x*tz,c+w*tz+x*ty-y*tx];}
+function attitude(s){
+ if(!s||s[1]===null)return null;
+ const sign=Number($('mount').value),q=s.slice(6,10),f=rotate(q,[0,0,sign]),r=rotate(q,[sign,0,0]),d=rotate(q,[0,1,0]);
+ return {forward:f,right:r,down:d,heading:(Math.atan2(f[1],f[0])*DEG+360)%360,pitch:Math.atan2(-f[2],Math.hypot(f[0],f[1]))*DEG,roll:Math.atan2(r[2],d[2])*DEG,
+  resolved:s[13]>=2&&s[14]!==null&&s[14]<90&&Math.hypot(f[0],f[1])>.05};
+}
+function setPlaying(v){playing=v;lastFrame=0;$('play').textContent=v?'Ⅱ Pause':'▶ Play';$('play').setAttribute('aria-label',v?'Pause':'Play');$('play').setAttribute('aria-pressed',String(v));}
+function seek(t){time=clamp(t,0,run.duration);lastFrame=0;dirty=true;}
+function setFollow(v){follow=v;$('follow').classList.toggle('active',v);$('follow').setAttribute('aria-pressed',String(v));dirty=true;}
+function fit(){const [x0,y0,x1,y1]=run.bounds;camera={x:(x0+x1)/2,y:(y0+y1)/2,scale:clamp(Math.min((width-140)/Math.max(100,x1-x0),(height-170)/Math.max(100,y1-y0)),.035,12)};setFollow(false);cache=null;dirty=true;}
+function zoom(factor,px=width/2,py=height/2){const wx=camera.x+(px-width/2)/camera.scale,wy=camera.y-(py-height/2)/camera.scale;camera.scale=clamp(camera.scale*factor,.025,15);camera.x=wx-(px-width/2)/camera.scale;camera.y=wy+(py-height/2)/camera.scale;cache=null;dirty=true;}
+function screen(x,y){return [width/2+(x-camera.x)*camera.scale,height/2-(y-camera.y)*camera.scale];}
+function stageBands(){
+ const rows=run[mode],bands=$('bands');bands.replaceChildren();
+ const intervals=[];for(let i=0;i<rows.length;i++){const a=rows[i][0],b=i+1<rows.length?rows[i+1][0]:run.duration;let stage=rows[i][13];const end=Math.min(b,a+.2);const prev=intervals[intervals.length-1];if(prev&&prev[2]===stage&&Math.abs(prev[1]-a)<.001)prev[1]=end;else intervals.push([a,end,stage]);if(end<b)intervals.push([end,b,0]);}
+ for(const [a,b,s] of intervals){const e=document.createElement('span');e.className='band';e.style.cssText=`left:${100*Math.max(0,a)/run.duration}%;width:${100*(b-Math.max(0,a))/run.duration}%;background:${STAGE_COLOR[s]}`;e.title=`${DATA.stages[s]} · ${timestamp(a)}–${timestamp(b)}`;bands.append(e);}
+ for(const [a,b] of run.gaps){const e=document.createElement('span');e.className='band';e.style.cssText=`left:${100*a/run.duration}%;width:${100*(b-a)/run.duration}%;background:#758591`;e.title='Recording gap';bands.append(e);}
+ const first=rows.find(r=>r[13]===3);$('first-nav').disabled=!first;$('first-nav').title=first?'First navigating at '+timestamp(first[0]):'This estimate never reached navigating';
+ $('ticks').replaceChildren();for(let i=0;i<=4;i++){const e=document.createElement('span');e.textContent=timestamp(run.duration*i/4,false);$('ticks').append(e);}
+ $('duration').textContent='/ '+timestamp(run.duration);$('scrub').max=run.duration;
+ $('selected-legend').textContent=mode==='replay'?'Replay':'Original live';$('other-legend').textContent=mode==='replay'?'Original live':'Replay';$('selected-swatch').style.background=COLORS[mode];$('other-swatch').style.background=COLORS[mode==='replay'?'recorded':'replay'];
+ $('run-note').textContent=run.gaps.length?'This run contains a 1.11 s recording gap near the end. The experimental replay resets there.':'Continuous IMU recording · no recording gaps detected.';
+ $('provenance').textContent=`${run.name}.mcap · variant ${DATA.variant} · OSM snapshot ${DATA.map.snapshot}. All geometry and recorded data are embedded in this file.`;
+}
+// A generously padded offscreen map lets follow mode translate the bitmap
+// without redrawing thousands of vector features on every animation frame.
+const featureOrder={park:0,water:1,building:2,waterway:3,coast:4,path:5,minor:6,road:7,major:8,rail:9};
+const features=DATA.map.features.slice().sort((a,b)=>featureOrder[a[0]]-featureOrder[b[0]]);
+function drawBase(){
+ const margin=220,w=width+2*margin,h=height+2*margin,scale=camera.scale;
+ const cv=document.createElement('canvas');cv.width=Math.ceil(w*dpr);cv.height=Math.ceil(h*dpr);const c=cv.getContext('2d');c.scale(dpr,dpr);c.fillStyle='#e8ebe3';c.fillRect(0,0,w,h);
+ const bx=camera.x,by=camera.y,view=[bx-w/2/scale,by-h/2/scale,bx+w/2/scale,by+h/2/scale];
+ const pt=(x,y)=>[w/2+(x-bx)*scale,h/2-(y-by)*scale];
+ const visible=features.filter(f=>f[3][0]<view[2]&&f[3][2]>view[0]&&f[3][1]<view[3]&&f[3][3]>view[1]);
+ const widths={major:Math.max(4,10*scale),road:Math.max(2.4,7*scale),minor:Math.max(1,4*scale),path:Math.max(.7,1.2*scale)};
+ c.lineJoin='round';c.lineCap='round';
+ for(const [kind,name,p,box,holes] of visible){
+  if(kind==='building'&&scale<.12)continue;if(kind==='path'&&scale<.1)continue;
+  c.beginPath();for(let i=0;i<p.length;i+=2){const [x,y]=pt(p[i],p[i+1]);i?c.lineTo(x,y):c.moveTo(x,y);}
+  c.setLineDash([]);
+  if(['building','park','water'].includes(kind)){c.closePath();for(const hole of holes){for(let i=0;i<hole.length;i+=2){const [x,y]=pt(hole[i],hole[i+1]);i?c.lineTo(x,y):c.moveTo(x,y);}c.closePath();}c.fillStyle=kind==='building'?'#d9dcd4':kind==='park'?'#d2e2cb':'#b4d4df';c.fill('evenodd');if(kind==='building'&&scale>.5){c.strokeStyle='#cdd1c8';c.lineWidth=.5;c.stroke();}}
+  else if(kind in widths){c.lineWidth=widths[kind]+(kind==='path'?0:1.5);c.strokeStyle=kind==='path'?'#c1c6ba':'#c9cec3';c.stroke();c.lineWidth=widths[kind];c.strokeStyle=kind==='major'?'#fff8e7':kind==='path'?'#f4f5ed':'#fcfcf7';if(kind==='path')c.setLineDash([2,3]);c.stroke();}
+  else {c.strokeStyle=(kind==='rail'?'#b7b5ae':'#9fc9d7');c.lineWidth=kind==='coast'?2:1;if(kind==='rail')c.setLineDash([4,4]);c.stroke();}
+ }
+ // Label streets along a long visible segment; reject overlapping labels.
+ const boxes=[],names=new Set();c.font='11px system-ui';c.textAlign='center';c.textBaseline='middle';
+ for(const f of visible.slice().sort((a,b)=>featureOrder[b[0]]-featureOrder[a[0]])){
+  const [kind,name,p]=f;if(!name||names.has(name)||!['road','major','park'].includes(kind)||(kind==='road'&&scale<.21))continue;
+  let best=null;for(let i=2;i<p.length;i+=2){const a=pt(p[i-2],p[i-1]),b=pt(p[i],p[i+1]),len=Math.hypot(b[0]-a[0],b[1]-a[1]);if(!best||len>best.len)best={a,b,len};}
+  if(!best)continue;const tw=c.measureText(name).width;if(best.len<tw+14)continue;
+  const x=(best.a[0]+best.b[0])/2,y=(best.a[1]+best.b[1])/2;if(x<30||y<20||x>w-30||y>h-20)continue;
+  let angle=Math.atan2(best.b[1]-best.a[1],best.b[0]-best.a[0]);if(angle>Math.PI/2)angle-=Math.PI;if(angle< -Math.PI/2)angle+=Math.PI;
+  const bw=Math.abs(Math.cos(angle))*tw+Math.abs(Math.sin(angle))*14+12,bh=Math.abs(Math.sin(angle))*tw+Math.abs(Math.cos(angle))*14+10;
+  const box=[x-bw/2,y-bh/2,x+bw/2,y+bh/2];if(boxes.some(b=>box[0]<b[2]&&box[2]>b[0]&&box[1]<b[3]&&box[3]>b[1]))continue;
+  boxes.push(box);names.add(name);c.save();c.translate(x,y);c.rotate(angle);c.strokeStyle='#f6f7ef';c.lineWidth=3;c.strokeText(name,0,0);c.fillStyle='#717d72';c.fillText(name,0,0);c.restore();
+ }
+ cache={canvas:cv,x:bx,y:by,scale,w,h,margin};
+}
+function pathTrack(rows,color,gps=false,tail=false){
+ const end=tail?upper(rows,time):rows.length,start=tail?Math.max(0,upper(rows,time-60)-1):0;
+ ctx.beginPath();let prev=null,lastPixel=null;
+ for(let i=start;i<end;i++){
+  const a=rows[i];if(a[1]===null||(gps&&!a[7])){prev=null;lastPixel=null;continue;}
+  const gap=prev&&(a[0]-prev[0]>(gps?.3:.2)||(gps?a[8]!==prev[8]:a[19]));
+  const p=screen(a[1],a[2]);if(!prev||gap){ctx.moveTo(...p);lastPixel=p;}else if(!lastPixel||Math.hypot(p[0]-lastPixel[0],p[1]-lastPixel[1])>.7||i===end-1){ctx.lineTo(...p);lastPixel=p;}
+  prev=a;
+ }
+ if(tail){const a=gps?sampleGps(time):sampleState(rows,time);if(a&&a[1]!==null&&prev&&time-prev[0]<(gps?.3:.2)&&!(a[19]))ctx.lineTo(...screen(a[1],a[2]));}
+ ctx.strokeStyle=color;ctx.globalAlpha=tail?.85:.23;ctx.lineWidth=tail?(gps?2:3):1.7;ctx.setLineDash(gps?[4,4]:[]);ctx.stroke();ctx.setLineDash([]);ctx.globalAlpha=1;
+}
+function marker(s,color,radius){if(!s||s[1]===null)return;const [x,y]=screen(s[1],s[2]);ctx.beginPath();ctx.arc(x,y,radius,0,Math.PI*2);ctx.fillStyle=color;ctx.fill();ctx.lineWidth=2;ctx.strokeStyle='#fff';ctx.stroke();}
+function arrow(x,y,dx,dy,length,color,dashed=false){const n=Math.hypot(dx,dy);if(n<1e-6)return;dx/=n;dy/=n;ctx.save();ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=2.7;ctx.setLineDash(dashed?[6,4]:[]);ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+dx*length,y+dy*length);ctx.stroke();ctx.setLineDash([]);ctx.beginPath();ctx.moveTo(x+dx*(length+3),y+dy*(length+3));ctx.lineTo(x+dx*(length-8)-dy*5,y+dy*(length-8)+dx*5);ctx.lineTo(x+dx*(length-8)+dy*5,y+dy*(length-8)-dx*5);ctx.closePath();ctx.fill();ctx.restore();}
+function drawMap(s,g,a){
+ const target=s&&s[1]!==null?s:g;if(follow&&target){camera.x=target[1];camera.y=target[2];}
+ if(!cache||cache.scale!==camera.scale||Math.abs((camera.x-cache.x)*camera.scale)>cache.margin-30||Math.abs((camera.y-cache.y)*camera.scale)>cache.margin-30)drawBase();
+ ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,width,height);
+ ctx.drawImage(cache.canvas,-cache.margin+(cache.x-camera.x)*camera.scale,-cache.margin-(cache.y-camera.y)*camera.scale,cache.w,cache.h);
+ const other=mode==='replay'?'recorded':'replay';
+ if($('show-other').checked){pathTrack(run[other],COLORS[other]);pathTrack(run[other],COLORS[other],false,true);marker(sampleState(run[other],time),COLORS[other],4);}
+ if($('show-gps').checked){pathTrack(run.gps,COLORS.gps,true);pathTrack(run.gps,COLORS.gps,true,true);}
+ pathTrack(run[mode],COLORS[mode]);pathTrack(run[mode],COLORS[mode],false,true);
+ if($('show-gps').checked&&g){marker(g,COLORS.gps,4);if(Math.hypot(g[3],g[4])>1.5){const [x,y]=screen(g[1],g[2]);arrow(x,y,g[4],-g[3],28,COLORS.gps,true);}}
+ if(s&&s[1]!==null){
+  const [x,y]=screen(s[1],s[2]);
+  if(a&&a.resolved){
+   const h=a.heading/DEG-Math.PI/2,sigma=Math.min(s[14]/DEG,Math.PI/3);
+   ctx.beginPath();ctx.moveTo(x,y);ctx.arc(x,y,74,h-sigma,h+sigma);ctx.closePath();ctx.fillStyle='#d49a2624';ctx.fill();
+   arrow(x,y,a.forward[1],-a.forward[0],74,'#bc7c12',s[13]!==3);
+  }
+  marker(s,COLORS[mode],6);
+ }
+ // Ground-distance scale, rounded down to a sensible 1/2/5 interval.
+ const targetMetres=100/camera.scale,power=10**Math.floor(Math.log10(targetMetres)),units=[1,2,5,10].filter(n=>n*power<=targetMetres),metres=(units.at(-1)||1)*power,pixels=metres*camera.scale;
+ ctx.strokeStyle='#3c5056';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(18,height-24);ctx.lineTo(18,height-19);ctx.lineTo(18+pixels,height-19);ctx.lineTo(18+pixels,height-24);ctx.stroke();ctx.fillStyle='#3c5056';ctx.font='10px system-ui';ctx.textAlign='left';ctx.fillText(metres>=1000?fmt(metres/1000,1)+' km':fmt(metres,0)+' m',22+pixels,height-16);
+}
+function drawHorizon(a){
+ const box=horizon.getBoundingClientRect(),w=box.width,h=box.height;
+ if(horizon.width!==Math.round(w*dpr)||horizon.height!==Math.round(h*dpr)){horizon.width=Math.round(w*dpr);horizon.height=Math.round(h*dpr);}
+ const c=horizon.getContext('2d');c.setTransform(dpr,0,0,dpr,0,0);c.clearRect(0,0,w,h);
+ const radius=Math.min(w*.42,h*.47),cx=w/2,cy=h/2;
+ c.save();c.beginPath();c.arc(cx,cy,radius,0,Math.PI*2);c.clip();c.fillStyle='#253844';c.fillRect(0,0,w,h);
+ if(a){
+  c.translate(cx,cy);c.rotate(-a.roll/DEG);const k=radius/43,offset=a.pitch*k;
+  c.fillStyle='#274b63';c.fillRect(-500,-1000,1000,1000+offset);c.fillStyle='#6a5742';c.fillRect(-500,offset,1000,1000);
+  c.strokeStyle='#c7d2d5';c.lineWidth=1.5;c.beginPath();c.moveTo(-500,offset);c.lineTo(500,offset);c.stroke();
+  c.font='10px system-ui';c.textAlign='center';c.textBaseline='middle';
+  for(let p=-80;p<=80;p+=10){if(!p)continue;const y=offset-p*k,len=p%20===0?25:15;c.strokeStyle='#cbd6da99';c.lineWidth=1;c.beginPath();c.moveTo(-len,y);c.lineTo(len,y);c.stroke();if(p%20===0){c.fillStyle='#e5ebec';c.fillText(String(p),-len-15,y);c.fillText(String(p),len+15,y);}}
+ }else{c.fillStyle='#a2b2bb';c.font='12px system-ui';c.textAlign='center';c.fillText('No attitude estimate',cx,cy+4);}
+ c.restore();c.beginPath();c.arc(cx,cy,radius,0,Math.PI*2);c.strokeStyle='#4a626f';c.lineWidth=1.5;c.stroke();
+ if(a){c.strokeStyle='#f6c46e';c.lineWidth=3;c.beginPath();c.moveTo(cx-40,cy);c.lineTo(cx-12,cy);c.lineTo(cx,cy+6);c.lineTo(cx+12,cy);c.lineTo(cx+40,cy);c.stroke();c.fillStyle='#f6c46e';c.beginPath();c.moveTo(cx,cy-radius+5);c.lineTo(cx-5,cy-radius+13);c.lineTo(cx+5,cy-radius+13);c.fill();}
+}
+function render(){
+ const s=sampleState(run[mode],time),g=sampleGps(time),a=attitude(s),gap=inGap(time),st=s?s[13]:null;
+ $('time').textContent=timestamp(time);$('scrub').value=time;$('scrub').setAttribute('aria-valuetext',timestamp(time)+' of '+timestamp(run.duration));$('clock').textContent=clockFormat.format(new Date((run.utc_start+time)*1000));
+ $('state').textContent=gap?'Recording gap':s?DATA.stages[st]:'No estimate';$('state-dot').style.background=s?STAGE_COLOR[st]:STAGE_COLOR[0];
+ $('reason').textContent=gap?'No IMU samples here; attitude and position are not interpolated across this interval.':s?run.reasons[s[17]]:'Waiting for the first state at this epoch.';
+ const speed=s&&s[10]!==null?Math.hypot(s[10],s[11])*3.6:null;
+ $('speed').textContent=speed===null?'—':fmt(speed);$('heading').textContent=a&&a.resolved?fmt(a.heading,0)+'°':'—';
+ const course=g&&Math.hypot(g[3],g[4])>1.5?(Math.atan2(g[4],g[3])*DEG+360)%360:null;
+ $('course').textContent=course===null?'— (slow / no fix)':fmt(course,0)+'° true';
+ $('uncertainty').textContent=s?fmt(s[14])+'° / '+fmt(s[15])+'°':'—';$('gnss-age').textContent=s&&s[16]!==null?fmt(s[16],2)+' s ago':'—';
+ $('separation').textContent=s&&s[1]!==null&&g?fmt(Math.hypot(s[1]-g[1],s[2]-g[2]))+' m':'—';
+ $('coordinates').textContent=s&&s[1]!==null?fmt(s[3],5)+', '+fmt(s[4],5):'—';
+ $('pitch').textContent=a?signed(a.pitch):'—';$('roll').textContent=a?signed(a.roll):'—';
+ $('map-note').textContent=gap?'Recording gap · no interpolated UKF pose':!s||s[1]===null?'No georeferenced estimate yet':!a.resolved?'Heading unresolved · boresight hidden':st!==3?'Tentative attitude · '+DATA.stages[st].toLowerCase():'';
+ if(s&&s[1]!==null){const [west,south,east,north]=DATA.map.source.bounds;if(s[3]<south||s[3]>north||s[4]<west||s[4]>east)$('map-note').textContent='Estimate is outside the embedded street-map area';}
+ drawMap(s,g,a);drawHorizon(a);
+}
+function resize(){const r=canvas.getBoundingClientRect(),first=!width;width=r.width;height=r.height;dpr=Math.min(window.devicePixelRatio||1,2);canvas.width=Math.round(width*dpr);canvas.height=Math.round(height*dpr);cache=null;if(first)fit();dirty=true;}
+function switchRun(index){run=DATA.runs[index];setPlaying(false);seek(0);stageBands();fit();}
+for(const [i,r] of DATA.runs.entries()){const o=document.createElement('option');o.value=i;o.textContent=r.label+' · '+timestamp(r.duration,false);$('run').append(o);}
+$('run').addEventListener('change',e=>switchRun(+e.target.value));
+$('estimate').addEventListener('change',e=>{mode=e.target.value;stageBands();dirty=true;});
+$('play').addEventListener('click',()=>{if(time>=run.duration)seek(0);setPlaying(!playing);});
+$('back').addEventListener('click',()=>seek(time-10));$('forward').addEventListener('click',()=>seek(time+10));
+$('rate').addEventListener('change',e=>{rate=+e.target.value;lastFrame=0;});
+$('scrub').addEventListener('input',e=>seek(+e.target.value));
+$('first-nav').addEventListener('click',()=>{const s=run[mode].find(r=>r[13]===3);if(s)seek(s[0]);});
+$('fit').addEventListener('click',fit);$('follow').addEventListener('click',()=>setFollow(!follow));
+$('zoom-in').addEventListener('click',()=>zoom(1.6));$('zoom-out').addEventListener('click',()=>zoom(1/1.6));
+for(const id of ['show-gps','show-other','mount'])$(id).addEventListener('change',()=>{dirty=true;});
+let drag=null;
+canvas.addEventListener('pointerdown',e=>{if(e.button!==0)return;drag={x:e.clientX,y:e.clientY,cx:camera.x,cy:camera.y};canvas.setPointerCapture(e.pointerId);canvas.classList.add('dragging');setFollow(false);});
+canvas.addEventListener('pointermove',e=>{if(!drag)return;camera.x=drag.cx-(e.clientX-drag.x)/camera.scale;camera.y=drag.cy+(e.clientY-drag.y)/camera.scale;dirty=true;});
+const endDrag=()=>{drag=null;canvas.classList.remove('dragging');};canvas.addEventListener('pointerup',endDrag);canvas.addEventListener('pointercancel',endDrag);canvas.addEventListener('lostpointercapture',endDrag);
+canvas.addEventListener('wheel',e=>{e.preventDefault();const r=canvas.getBoundingClientRect();zoom(Math.exp(-clamp(e.deltaY,-200,200)*.003),e.clientX-r.left,e.clientY-r.top);},{passive:false});
+canvas.addEventListener('dblclick',e=>{const r=canvas.getBoundingClientRect();zoom(2,e.clientX-r.left,e.clientY-r.top);});
+document.addEventListener('keydown',e=>{if(e.target.closest('input,select,button,summary'))return;const step=e.shiftKey?10:1;if(e.code==='Space'){e.preventDefault();if(time>=run.duration)seek(0);setPlaying(!playing);}else if(e.key==='ArrowLeft'){e.preventDefault();seek(time-step);}else if(e.key==='ArrowRight'){e.preventDefault();seek(time+step);}else if(e.key==='Home'){e.preventDefault();seek(0);}else if(e.key==='End'){e.preventDefault();seek(run.duration);}else if(e.key.toLowerCase()==='f')fit();});
+document.addEventListener('visibilitychange',()=>{if(document.hidden)setPlaying(false);});
+new ResizeObserver(resize).observe($('map-wrap'));window.addEventListener('resize',()=>{dirty=true;});
+function frame(now){
+ if(playing){if(lastFrame){time=Math.min(run.duration,time+(now-lastFrame)/1000*rate);if(time>=run.duration)setPlaying(false);}lastFrame=now;dirty=true;}
+ if(dirty){render();dirty=false;}requestAnimationFrame(frame);
+}
+stageBands();resize();requestAnimationFrame(frame);
+</script>
+</body>
+</html>

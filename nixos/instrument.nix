@@ -64,9 +64,10 @@ in {
     SupplementaryGroups = [ "navigation" ];
   };
   environment.systemPackages = [ radarPackage systemTools gui sdrGui ];
+  environment.etc."pl64/radar-presets".source = "${radarPackage}/share/dvbt_passive_radar/recordings/presets";
   systemd.services.pl64-radar = lib.recursiveUpdate
     (service "DVB-T capture (idle until requested)" "radar" "pl64-radar"
-      "${radarPackage}/bin/dvbt-service --metadata ${radarPackage}/share/dvbt_passive_radar/recordings/live_usdr_mt_dandenong.json --config /var/lib/pl64-radar/settings.json") {
+      "${radarPackage}/bin/dvbt-service --metadata ${radarPackage}/share/dvbt_passive_radar/recordings/live_usdr_mt_dandenong.json") {
       serviceConfig.ReadWritePaths = [ "/run/lock/pl64-radio.lock" ];
       serviceConfig.SupplementaryGroups = [ "usdr" "render" "video" ];
       serviceConfig.StateDirectory = "pl64-radar";

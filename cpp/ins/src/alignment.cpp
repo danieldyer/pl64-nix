@@ -218,9 +218,8 @@ std::optional<NavigationState> align(const Config &config, const Earth &earth,
     out.covariance = (transport * out.covariance * transport.transpose()).eval();
     const Mat3 lever_rate = r * skew(config.gnss_lever);
     out.covariance.block<3, 3>(3, 3) +=
-        lever_rate *
-        (config.noise.gyro_density.array().square() * config.imu_rate).matrix().asDiagonal() *
-        lever_rate.transpose();
+        lever_rate * config.body_noise_covariance(config.noise.gyro_density) *
+        config.imu_rate * lever_rate.transpose();
     return out;
 }
 } // namespace ins

@@ -73,6 +73,7 @@ int main(int argc, char **argv) {
                 meta.stamp = r.stamp;
                 meta.detail = nlohmann::json{
                     {"navigation", ins::configuration_json(config)},
+                    {"imu_frame_convention", ins::imu_frame_convention},
                     {"schema_path", schema.string()},
                     {"mode",
                      mode}}.dump();

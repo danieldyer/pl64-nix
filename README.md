@@ -440,11 +440,15 @@ image. Building this configuration neither activates it on the PL64 nor programs
 the FPGA. Validate the FPGA build before deploying the matched set for target
 tests. Temporary experiments may live under `/tmp`; keep enduring settings here.
 
-To refresh the patch from the driver checkout after an essential-fix commit:
+The essential patch retains the pre-corrector receive fixes. Refresh the separate
+correction patches from the committed driver and FPGA checkouts:
 
 ```sh
-git -C ../usdr-lib diff --binary f7e869df29582934b87d3759e3c108d60a27e451 HEAD \
-  -- src audit/2026-10-22/native_rx_probe.c > pkgs/usdr/essential-rx.patch
+git -C ../usdr-lib diff --binary 23604da HEAD -- \
+  src/lib/device/m2_lm6_1/m2_lm6_1.c src/lib/device/m2_lm6_1/usdr_ctrl.c \
+  src/lib/device/m2_lm6_1/usdr_ctrl.h src/utests/rfic/usdr_ctrl_test.c \
+  > pkgs/usdr/blind-iq.patch
+git -C ../usdr-fpga diff --binary a2e830c HEAD > pkgs/usdr/blind-iq-fpga.patch
 ```
 
 Update `revision` in `pkgs/usdr/default.nix` to the corresponding driver commit,
@@ -452,10 +456,11 @@ rebuild the three packages, and retain the matched FPGA source/build identity.
 The FPGA bitstream remains a separately built Vivado artifact; there is no
 automatic flash or firmware-update service.
 
-The 24 October 2026 bring-up uses driver `49c3d57` and operational FPGA
-`c53414a7` (RTL `04a3c78`; clean build flow `a2e830c`). A physical power cycle
-confirmed PCIe boot and automatic module loading. Short native receive tests
-passed at 8, 61.44 and 64 MS/s; full RF qualification is still pending. The
+The 7 November 2026 deployment uses driver `14cc62c` and operational FPGA
+`3db57a98` (RTL `c0f03a0`; build flow `44a6157`). A physical power cycle
+confirmed the autonomous corrector; native receive at 64 MS/s passed without
+loss or timeouts. The previous `c53414a7` image remains packaged for rollback.
+Full RF qualification is still pending. The
 driver patch includes the rev3 reference-buffer startup order and receive-only,
 repeatable analog DC calibration fixes found during these checks. Detailed
 results are in `usdr-lib/audit/2026-10-22/TARGET_TESTS.txt`.
@@ -622,8 +627,12 @@ builds and tests the application; `.#system` includes its COM2-activated service
 The implementation uses one square-root UKF with bounded delayed-measurement
 replay and a coarse/fine alignment state machine. Sensor simulation is test-only.
 The module README describes local CMake builds, configuration, recording/replay,
-and the state interface. Set the measured GNSS lever arm and mounting rotation
-before using navigation output; the checked-in geometry is provisional.
+and the state interface. The PL64 uses the accepted motion-inferred mounting:
+`services.pl64-ins.imuToAntennaQuaternion = [ 0.0 1.0 0.0 0.0 ];`.
+The antenna frame has +Z along boresight and +Y mainly down. The decoder separately
+normalizes the IMU50 gyro axes, and coarse alignment retains 60 seconds of motion.
+The GNSS lever arm remains provisional; replace it with the measured vector in
+antenna/body axes. Position is still reported at the IMU reference point.
 
 ## Integrated radar, navigation and recording
 
@@ -709,7 +718,7 @@ flowchart LR
 | `pl64-ins` | Existing sensor initialization and alignment lifecycle | `/run/pl64-ins/{records,control,state}.sock` |
 | `pl64-radar` | Idle; no radio or GPU is opened until Start | `/run/pl64-radar/{records,preview,control}.sock` |
 | `pl64-sar` | Idle; Start enables subscriptions | `/run/pl64-sar/{records,control}.sock` |
-| `pl64-recorder` | Subscribes independently; logging enabled | `/run/pl64-recorder/control.sock` |
+| `pl64-recorder` | Subscribes independently; logging off | `/run/pl64-recorder/control.sock` |
 
 The radar state machine is Idle → Starting → Running → Draining → Idle, with
 Fault for errors. Stop requests drain the decoder and scientific output before
@@ -717,9 +726,11 @@ returning Idle. Configuration is validated and changed while inactive. Radio
 capture and the managed SDR++ session share `/run/lock/pl64-radio.lock`, so they
 cannot acquire the radio simultaneously. Opening or closing the control GUI
 does not start or stop acquisition.
-Applied capture settings are saved atomically in `/var/lib/pl64-radar/settings.json`
-and restored on service restart, while capture still starts Idle. If that file
-is invalid, packaged defaults are used with a visible configuration warning.
+The deployed daemon starts with the packaged lower VHF preset. GUI configuration
+is session-only: loading a JSON or applying edits never writes back to it, and
+restarting the radar service restores packaged defaults. Standalone deployments
+can opt into persisted service settings with `dvbt-service --config FILE`;
+`configure` also accepts `"persist": false` to bypass that file.
 TPS/pilot tracking without validated RS data does not establish a usable
 scientific reference. Automatic origin calibration waits for validated data
 and rejects coordinates outside finite profile support. Acquisition and status
@@ -729,7 +740,13 @@ continue while profiles are withheld; the GUI shows these channels as amber
 The recorder owns `/var/lib/pl64-recordings/session-*.mcap`. Each file can contain
 navigation, radar and SAR topics, with embedded binary schemas, source stream
 IDs, effective configuration, boot identity and executable paths. Recording can
-be enabled globally or selected per source. Disabling recording drains currently
+be enabled globally or selected per source. **Start pipeline** opens only DVB-T
+and leaves logging off. **Start capture** enables the recorder and starts DVB-T
+if it is inactive; when already running, it records without restarting the radio.
+**Stop capture** finalizes the recording and leaves DVB-T and navigation running.
+Navigation always starts at boot, independently of these controls. Every file
+includes a session-start snapshot of the current service settings, including
+when recording begins after the radio was started. Disabling recording drains currently
 queued messages before finalizing the file. Files rotate at approximately 1 GiB
 or 15 minutes. In-progress or failed files retain `.partial.mcap`; a successful
 close renames the file to `.mcap`. Low disk space or write errors put the recorder
@@ -841,8 +858,13 @@ layout restores it manually. The overview strip keeps service state and logging
 visible, capture controls sit beside the range–Doppler plot, and navigation,
 recording and SAR have dockable tabs. Keys 1–9 select channels; T toggles detailed
 channel timing. View also opens the full telemetry tree and command results.
-Gain, range, integration, map update, Doppler, worker counts and channel I/Q
-logging have native controls. Full RF/site metadata is available under Advanced
+Configuration offers three packaged JSON presets, plus Load JSON for a local
+capture metadata or service-settings file. Centre frequency, sample rate,
+baseband bandwidth, input port, gain, range, integration, map update, Doppler,
+worker counts and channel I/Q logging have native controls. Stop the DVB-T
+pipeline to edit; Apply settings uses the edits for this service session.
+Discard edits returns to the current applied settings. Unapplied or rejected
+configurations block starting acquisition. Full RF/site metadata is available under Advanced
 metadata & settings. Rejected commands are shown beside the capture controls.
 
 Control is available without the GUI:
@@ -854,7 +876,8 @@ pl64-ctl radar stop
 pl64-ctl ins reset
 pl64-ctl sar start
 pl64-ctl sar stop
-pl64-ctl recorder '{"op":"recording","enabled":false}'
+pl64-ctl recorder start  # Starts disk logging, and DVB-T if necessary
+pl64-ctl recorder stop   # Stops disk logging; navigation and DVB-T keep running
 pl64-ctl recorder '{"op":"select","source":"radar","enabled":true}'
 pl64-mcap-check /var/lib/pl64-recordings/session-EXAMPLE.mcap
 ```
@@ -869,3 +892,33 @@ It runs real decoding/profile formation with a waveform fixture, uses an
 explicitly simulated navigation source, exercises controls and shared
 subscriptions, and verifies the resulting multi-topic MCAPs. It does not open
 hardware or establish physical navigation/radar accuracy.
+
+### RF presets and direct Ethernet
+
+| Preset | Multiplexes | Centre | Sample rate | Analog baseband BW | Input | Relative gain |
+| --- | --- | --- | --- | --- | --- | --- |
+| Lower VHF | Seven, SBS, Nine | 184.625 MHz | 64 MS/s | 28 MHz | VHF / EXT | 0 dB |
+| Upper VHF | Ten, ABC | 223 MHz | 64 MS/s | 20 MHz | VHF / EXT | 0 dB |
+| UHF | C31 (557.625 MHz) | 557.750 MHz | 64 MS/s | 10 MHz | UHF / W | 0 dB |
+
+Presets live in the separate radar repo's `recordings/presets/` and are exposed
+read-only at `/etc/pl64/radar-presets`. The 200 MHz external low-pass filter
+must be removed for upper VHF and UHF. The same approximately 40 dB amplified
+chain calls for a conservative minimum receiver gain; upper VHF/UHF gains are
+starting points pending measurements with the appropriate RF feed. Analog
+bandwidth is the full complex RF passband and is independent of sample rate.
+
+Both physical Ethernet ports use declarative NetworkManager profiles matched
+to their permanent MAC addresses. They try DHCP and use IPv4 link-local fallback
+(169.254/16) while no lease exists, plus normal IPv6 autoconfiguration/link-local.
+Avahi advertises `pl64.local` on each active link; SSH and mDNS are allowed through
+the firewall. A directly connected laptop using automatic addressing can use
+`ssh root@pl64.local` with its authorized SSH key. Neither a DHCP server nor
+Internet access is needed. DHCP remains active when a server becomes available.
+These profiles do not bridge ports or serve DHCP. Physical cable tests are
+separate from software validation if neither port has carrier.
+
+Autonomous FPGA DC/IQ correction is enabled by the matched uSDR library. The
+GUI exposes a session-only bypass and raw ADC health independently of corrected
+stream levels. Correction snapshots are included in service status and MCAP;
+the FPGA ADC epoch is explicitly not claimed to be mapped to DMA time or UTC.

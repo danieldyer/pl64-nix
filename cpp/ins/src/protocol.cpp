@@ -90,6 +90,11 @@ std::expected<ImuSample, std::string> decode_imu(std::span<const std::uint8_t> f
     }
     if (!s.omega.allFinite() || !s.force.allFinite())
         return std::unexpected("Non-finite IMU sample");
+    // IMU50 packet gyro coordinates differ from its accelerometer coordinates.
+    // Identified from the recorded motion/force/GNSS consistency checks:
+    // omega_accel = [packet_y, -packet_x, packet_z]. This intrinsic sensor
+    // normalization precedes the common sensor-to-body mounting rotation.
+    s.omega = Vec3(s.omega.y(), -s.omega.x(), s.omega.z());
     unsigned counter = 0;
     for (int i = 28; i < 30; ++i) {
         if ((f[i] >> 4) > 9 || (f[i] & 15) > 9)
@@ -145,8 +150,10 @@ std::vector<std::uint8_t> encode_imu(const Vec3 &w, const Vec3 &a, std::uint8_t 
     f[0] = 0x77;
     f[1] = 32;
     f[3] = 0x70;
+    // Encoder inputs share the accelerometer frame, as decode_imu outputs do.
+    const Vec3 wire_gyro(-w.y(), w.x(), w.z());
     for (int i = 0; i < 3; ++i) {
-        write<float>(f, 4 + 4 * i, static_cast<float>(w[i] / degrees));
+        write<float>(f, 4 + 4 * i, static_cast<float>(wire_gyro[i] / degrees));
         write<float>(f, 16 + 4 * i, static_cast<float>(a[i] / standard_gravity));
     }
     const unsigned hi = count / 100, lo = count % 100;
